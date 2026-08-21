@@ -241,7 +241,7 @@ err := portalite.ProxyWithConfig(ctx, listener, portalite.ProxyConfig{
 
 The proxy maintains one connected local UDP socket per relay/flow pair, expires idle flows after five minutes, and caps active flows at 1024. QUIC token rotation reconnects the backhaul without changing the public UDP address.
 
-UDP is relay-dependent. A relay that returns `udp_disabled`, exhausts its UDP port pool, or rejects the datagram transport fails independently; other UDP-capable relays continue. At the time of writing, `s-h.day` and `gosunuts.xyz` advertise UDP support. Treat this as operational state rather than a permanent registry guarantee.
+UDP availability is relay-dependent and can change at runtime. A relay that returns `udp_disabled`, exhausts its UDP port pool, or rejects the datagram transport fails independently; other UDP-capable relays continue. Use `WaitDatagramReady`, `Updates`, or `Relays` to observe current capability instead of inferring it from the default registry.
 
 Portalite still excludes raw TCP port allocation, multi-hop, and ECH controls. Receiving the raw stream marker remains a terminal protocol error for that relay.
 
