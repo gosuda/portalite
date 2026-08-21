@@ -60,6 +60,37 @@ func main() {
 }
 ```
 
+### Runnable HTTP server
+
+`cmd/http-demo` is a complete server that passes the virtual listener directly to `http.Server.Serve`:
+
+```sh
+go run ./cmd/http-demo
+```
+
+It prints one URL for each ready relay:
+
+```text
+URL https://http-demo-0123456789ab.relay.example
+```
+
+Use any printed URL while the process is running:
+
+```sh
+curl https://http-demo-0123456789ab.relay.example/hello
+```
+
+Limit the demo to explicit relays or choose an identity name:
+
+```sh
+go run ./cmd/http-demo \
+  --relay https://rly.best \
+  --relay https://gosunuts.xyz \
+  --name my-http-demo
+```
+
+The demo generates an ephemeral private key on every run and never writes it to disk. Without `--name`, it also generates a unique identity name.
+
 For a long-running server, start `Serve` immediately and observe `Updates` in another goroutine instead of blocking on `WaitReady`. `WaitReady` does not consume the update stream.
 
 ```go
