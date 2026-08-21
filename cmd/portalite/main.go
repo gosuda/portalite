@@ -19,7 +19,7 @@ import (
 	"gosuda.org/portalite"
 )
 
-const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] TARGET\n"
+const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--udp-target TARGET] [TARGET]\n"
 
 type relayFlags []string
 
@@ -82,9 +82,11 @@ func runWithIdentityLoader(
 	var relayValues relayFlags
 	var identityPath string
 	var name string
+	var udpTarget string
 	fs.Var(&relayValues, "relay", "relay HTTPS URL")
 	fs.StringVar(&identityPath, "identity", "identity.json", "identity file")
 	fs.StringVar(&name, "name", "", "identity name for a new identity")
+	fs.StringVar(&udpTarget, "udp-target", "", "local UDP target")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			writeUsage(stdout)
@@ -92,16 +94,25 @@ func runWithIdentityLoader(
 		}
 		return usageError(stderr, err.Error())
 	}
-	if fs.NArg() == 0 {
-		return usageError(stderr, "missing TARGET")
+	if fs.NArg() > 1 {
+		return usageError(stderr, "expected at most one TCP TARGET")
 	}
-	if fs.NArg() != 1 {
-		return usageError(stderr, "expected exactly one TARGET")
+	target := ""
+	var err error
+	if fs.NArg() == 1 {
+		target, err = portalite.NormalizeTarget(fs.Arg(0))
+		if err != nil {
+			return usageError(stderr, err.Error())
+		}
 	}
-
-	target, err := portalite.NormalizeTarget(fs.Arg(0))
-	if err != nil {
-		return usageError(stderr, err.Error())
+	if udpTarget != "" {
+		udpTarget, err = portalite.NormalizeTarget(udpTarget)
+		if err != nil {
+			return usageError(stderr, err.Error())
+		}
+	}
+	if target == "" && udpTarget == "" {
+		return usageError(stderr, "missing TCP TARGET or --udp-target")
 	}
 	relays, err := selectRelays(relayValues)
 	if err != nil {
@@ -122,8 +133,9 @@ func runWithIdentityLoader(
 		return 0
 	}
 	exposure, err := portalite.Expose(ctx, portalite.ExposeConfig{
-		Relays:   relays,
-		Identity: identity,
+		Relays:     relays,
+		Identity:   identity,
+		UDPEnabled: udpTarget != "",
 	})
 	if err != nil {
 		if ctx.Err() != nil {
@@ -141,16 +153,14 @@ func runWithIdentityLoader(
 	go func() {
 		defer updates.Done()
 		for status := range exposure.Updates() {
-			switch status.State {
-			case portalite.RelayReady:
-				fmt.Fprintf(stdout, "URL %s\n", status.PublicURL)
-			case portalite.RelayFailed:
-				fmt.Fprintf(stderr, "portalite: relay %s: %v\n", status.RelayURL, status.Err)
-			}
+			writeRelayStatus(stdout, stderr, status)
 		}
 	}()
 
-	err = portalite.Proxy(ctx, exposure, target)
+	err = portalite.ProxyWithConfig(ctx, exposure, portalite.ProxyConfig{
+		TCPTarget: target,
+		UDPTarget: udpTarget,
+	})
 	updates.Wait()
 	if ctx.Err() != nil {
 		return 0
@@ -163,6 +173,17 @@ func runWithIdentityLoader(
 		return 1
 	}
 	return 0
+}
+
+func writeRelayStatus(stdout, stderr io.Writer, status portalite.RelayStatus) {
+	switch status.State {
+	case portalite.RelayReady:
+		fmt.Fprintf(stdout, "URL %s\n", status.PublicURL)
+	case portalite.RelayUDPReady:
+		fmt.Fprintf(stdout, "UDP %s\n", status.UDPAddr)
+	case portalite.RelayFailed:
+		fmt.Fprintf(stderr, "portalite: relay %s: %v\n", status.RelayURL, status.Err)
+	}
 }
 
 func writeUsage(w io.Writer) {

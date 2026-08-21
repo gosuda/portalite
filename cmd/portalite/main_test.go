@@ -57,10 +57,11 @@ func TestRunHelpAndInvalidInvocation(t *testing.T) {
 	}{
 		{name: "missing command", message: "missing command"},
 		{name: "unknown command", args: []string{"serve"}, message: `unknown command "serve"`},
-		{name: "missing target", args: []string{"expose"}, message: "missing TARGET"},
-		{name: "extra target", args: []string{"expose", "8080", "9090"}, message: "expected exactly one TARGET"},
+		{name: "missing target", args: []string{"expose"}, message: "missing TCP TARGET or --udp-target"},
+		{name: "extra target", args: []string{"expose", "8080", "9090"}, message: "expected at most one TCP TARGET"},
 		{name: "invalid target", args: []string{"expose", "https://target.example"}, message: "target must be a TCP host and port, not a URL"},
 		{name: "invalid relay", args: []string{"expose", "--relay", "http://relay.example", "8080"}, message: "relay 1: relay URL must use HTTPS"},
+		{name: "invalid UDP target", args: []string{"expose", "--udp-target", "https://target.example"}, message: "target must be a TCP host and port, not a URL"},
 	}
 	for _, test := range tests {
 		test := test
@@ -100,6 +101,12 @@ func TestRunValidatesBeforeIdentityIO(t *testing.T) {
 				return []string{"expose", "--identity", identity, "--relay", "http://relay.example", "8080"}
 			},
 		},
+		{
+			name: "udp target",
+			args: func(identity string) []string {
+				return []string{"expose", "--identity", identity, "--udp-target", "https://target.example"}
+			},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -114,6 +121,46 @@ func TestRunValidatesBeforeIdentityIO(t *testing.T) {
 				t.Fatalf("identity parent was touched before validation: stat error = %v", err)
 			}
 		})
+	}
+}
+
+func TestRunAcceptsUDPOnlyBeforeCancelledContext(t *testing.T) {
+	identity, err := portalite.IdentityFromPrivateKey(
+		"udp-only",
+		"0000000000000000000000000000000000000000000000000000000000000001",
+	)
+	if err != nil {
+		t.Fatalf("identity: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	called := false
+	loader := func(_, _ string) (portalite.Identity, error) {
+		called = true
+		return identity, nil
+	}
+	var stdout, stderr bytes.Buffer
+	code := runWithIdentityLoader(ctx, []string{"expose", "--udp-target", ":5353"}, &stdout, &stderr, loader)
+	if code != 0 {
+		t.Fatalf("UDP-only canceled run exit = %d, stderr = %q", code, stderr.String())
+	}
+	if !called {
+		t.Fatal("UDP-only invocation did not reach identity loading")
+	}
+}
+
+func TestWriteUDPRelayStatus(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	writeRelayStatus(&stdout, &stderr, portalite.RelayStatus{
+		RelayURL: "https://relay.example",
+		UDPAddr:  "relay.example:40000",
+		State:    portalite.RelayUDPReady,
+	})
+	if stdout.String() != "UDP relay.example:40000\n" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q", stderr.String())
 	}
 }
 

@@ -96,29 +96,105 @@ func (a *activeProxyPairs) closeAll() {
 	}
 }
 
-// Proxy is the sole Accept consumer for exposure and copies bytes between each
-// tenant connection and the validated local TCP target.
+// ProxyConfig selects local TCP and UDP targets. At least one target is
+// required. ProxyWithConfig is the sole stream and datagram consumer.
+type ProxyConfig struct {
+	TCPTarget string
+	UDPTarget string
+}
+
+// Proxy copies tenant streams to a local TCP target.
 func Proxy(ctx context.Context, exposure *Exposure, target string) error {
+	return ProxyWithConfig(ctx, exposure, ProxyConfig{TCPTarget: target})
+}
+
+// ProxyUDP copies relayed datagrams to a local UDP target.
+func ProxyUDP(ctx context.Context, exposure *Exposure, target string) error {
+	return ProxyWithConfig(ctx, exposure, ProxyConfig{UDPTarget: target})
+}
+
+// ProxyWithConfig runs TCP and UDP proxy loops together and closes exposure
+// after cancellation or the first terminal proxy error.
+func ProxyWithConfig(ctx context.Context, exposure *Exposure, config ProxyConfig) error {
 	if exposure == nil {
 		return errors.New("portalite: exposure is nil")
 	}
 	if ctx == nil {
 		return errors.Join(errors.New("portalite: context is nil"), exposure.Close())
 	}
-	normalizedTarget, err := NormalizeTarget(target)
-	if err != nil {
-		return errors.Join(err, exposure.Close())
+
+	var err error
+	if config.TCPTarget != "" {
+		config.TCPTarget, err = NormalizeTarget(config.TCPTarget)
+		if err != nil {
+			return errors.Join(err, exposure.Close())
+		}
+	}
+	if config.UDPTarget != "" {
+		config.UDPTarget, err = NormalizeTarget(config.UDPTarget)
+		if err != nil {
+			return errors.Join(err, exposure.Close())
+		}
+	}
+	workerCount := 0
+	if config.TCPTarget != "" {
+		workerCount++
+	}
+	if config.UDPTarget != "" {
+		workerCount++
+	}
+	if workerCount == 0 {
+		return errors.Join(errors.New("portalite: at least one proxy target is required"), exposure.Close())
 	}
 
 	proxyCtx, cancel := context.WithCancel(ctx)
+	results := make(chan error, workerCount)
+	if config.TCPTarget != "" {
+		go func() { results <- runTCPProxy(proxyCtx, exposure, config.TCPTarget) }()
+	}
+	if config.UDPTarget != "" {
+		go func() { results <- runUDPProxy(proxyCtx, exposure, config.UDPTarget) }()
+	}
+	var primary error
+	gotFirst := false
+	select {
+	case <-ctx.Done():
+	case primary = <-results:
+		gotFirst = true
+	}
+	cancel()
+	closeErr := exposure.Close()
+	received := 0
+	if gotFirst {
+		received = 1
+	}
+	for received < workerCount {
+		workerErr := <-results
+		received++
+		if primary == nil && workerErr != nil && !errors.Is(workerErr, context.Canceled) && !errors.Is(workerErr, net.ErrClosed) {
+			primary = workerErr
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	if errors.Is(primary, ErrNoRelays) {
+		return errors.Join(ErrNoRelays, closeErr)
+	}
+	if primary != nil && !errors.Is(primary, context.Canceled) && !errors.Is(primary, net.ErrClosed) {
+		return errors.Join(primary, closeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close exposure: %w", closeErr)
+	}
+	return primary
+}
+
+func runTCPProxy(ctx context.Context, exposure *Exposure, target string) error {
 	active := activeProxyPairs{pairs: make(map[*proxyPair]struct{})}
 	var connections sync.WaitGroup
-
-	stopContextClose := context.AfterFunc(ctx, func() {
-		cancel()
-		active.closeAll()
-		_ = exposure.Close()
-	})
+	stopContextClose := context.AfterFunc(ctx, active.closeAll)
 
 	var acceptErr error
 	for {
@@ -133,32 +209,17 @@ func Proxy(ctx context.Context, exposure *Exposure, target string) error {
 		go func() {
 			defer connections.Done()
 			defer active.remove(pair)
-			proxyConnection(proxyCtx, pair, normalizedTarget)
+			proxyConnection(ctx, pair, target)
 		}()
 	}
 
-	cancel()
 	active.closeAll()
-	closeErr := exposure.Close()
 	connections.Wait()
 	stopContextClose()
-
 	if ctx.Err() != nil {
-		return nil
+		return ctx.Err()
 	}
-	if errors.Is(acceptErr, ErrNoRelays) {
-		return errors.Join(ErrNoRelays, closeErr)
-	}
-	if acceptErr != nil && !errors.Is(acceptErr, net.ErrClosed) {
-		return errors.Join(acceptErr, closeErr)
-	}
-	if acceptErr != nil {
-		return errors.Join(acceptErr, closeErr)
-	}
-	if closeErr != nil {
-		return fmt.Errorf("close exposure: %w", closeErr)
-	}
-	return nil
+	return acceptErr
 }
 
 func proxyConnection(ctx context.Context, pair *proxyPair, target string) {

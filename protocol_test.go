@@ -92,6 +92,20 @@ func TestRelayDomainCompatibilityChecks(t *testing.T) {
 	}
 }
 
+func TestUDPChallengeWireContract(t *testing.T) {
+	encoded, err := json.Marshal(challengeRequest{
+		Identity:   identityRef{Name: "alice", Address: scalarOneAddress},
+		TTL:        120,
+		UDPEnabled: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal UDP challenge: %v", err)
+	}
+	want := `{"identity":{"name":"alice","address":"` + scalarOneAddress + `"},"ttl":120,"udp_enabled":true}`
+	if string(encoded) != want {
+		t.Fatalf("UDP challenge JSON = %s, want %s", encoded, want)
+	}
+}
 func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	identity, err := IdentityFromPrivateKey("alice", scalarOnePrivateKey)
 	if err != nil {

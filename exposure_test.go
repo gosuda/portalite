@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+
+	"github.com/quic-go/quic-go"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -46,6 +48,7 @@ type fakeRelayOptions struct {
 	signRequestRelease   <-chan struct{}
 	signRequestFinished  chan<- struct{}
 	invalidSigner        bool
+	udpEnabled           bool
 }
 
 type fakeRelaySession struct {
@@ -84,6 +87,7 @@ type fakeRelay struct {
 	challengeMessage      string
 	challengeIdentity     identityRef
 	currentToken          string
+	challengeUDPEnabled   bool
 	leaseNotFoundSent     bool
 	transientRenewSent    bool
 	connectLeaseLost      bool
@@ -94,6 +98,10 @@ type fakeRelay struct {
 	sessions              map[int]*fakeRelaySession
 	connectTokens         []string
 	signTokens            []string
+	quicListener          *quic.Listener
+	quicDone              chan error
+	quicConn              *quic.Conn
+	quicTokens            []string
 	unregisterTokens      []string
 	closed                bool
 }
@@ -197,7 +205,119 @@ func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRela
 	go func() {
 		relay.serveDone <- relay.server.Serve(tlsListener)
 	}()
+	if options.udpEnabled {
+		quicListener, err := quic.ListenAddr(
+			net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+			&tls.Config{
+				MinVersion:   tls.VersionTLS13,
+				NextProtos:   []string{quicBackhaulALPN},
+				Certificates: []tls.Certificate{certificate},
+			},
+			quicClientConfig(),
+		)
+		if err != nil {
+			_ = relay.server.Close()
+			_ = relay.listener.Close()
+			t.Fatalf("listen for fake QUIC relay: %v", err)
+		}
+		relay.quicListener = quicListener
+		relay.quicDone = make(chan error, 1)
+		go func() { relay.quicDone <- relay.serveQUIC() }()
+	}
 	return relay
+}
+
+func (r *fakeRelay) serveQUIC() error {
+	for {
+		conn, err := r.quicListener.Accept(context.Background())
+		if err != nil {
+			r.mu.Lock()
+			closed := r.closed
+			r.mu.Unlock()
+			if closed {
+				return nil
+			}
+			return err
+		}
+		go r.handleQUIC(conn)
+	}
+}
+
+func (r *fakeRelay) handleQUIC(conn *quic.Conn) {
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		r.recordError(fmt.Errorf("accept QUIC control stream: %w", err))
+		_ = conn.CloseWithError(1, "control stream failed")
+		return
+	}
+	_ = stream.SetDeadline(time.Now().Add(fakeRelayWait))
+	var request quicBackhaulControlMessage
+	if err := json.NewDecoder(io.LimitReader(stream, quicBackhaulControlBodyLimit)).Decode(&request); err != nil {
+		r.recordError(fmt.Errorf("decode QUIC control stream: %w", err))
+		_ = conn.CloseWithError(1, "control decode failed")
+		return
+	}
+	r.mu.Lock()
+	valid := request.AccessToken != "" && request.AccessToken == r.currentToken && r.challengeUDPEnabled
+	old := r.quicConn
+	if valid {
+		r.quicTokens = append(r.quicTokens, request.AccessToken)
+		r.quicConn = conn
+		r.signalLocked()
+	}
+	r.mu.Unlock()
+	if !valid {
+		_ = json.NewEncoder(stream).Encode(quicBackhaulControlResponse{OK: false, Error: "unauthorized"})
+		_ = stream.Close()
+		_ = conn.CloseWithError(1, "unauthorized")
+		return
+	}
+	if old != nil && old != conn {
+		_ = old.CloseWithError(0, "replaced")
+	}
+	if err := json.NewEncoder(stream).Encode(quicBackhaulControlResponse{OK: true}); err != nil {
+		r.recordError(fmt.Errorf("encode QUIC control response: %w", err))
+		_ = conn.CloseWithError(1, "control response failed")
+		return
+	}
+	_ = stream.Close()
+}
+
+func (r *fakeRelay) waitForQUICConn(t *testing.T) *quic.Conn {
+	t.Helper()
+	r.waitFor(t, "QUIC backhaul", func() bool { return r.quicConn != nil })
+	r.mu.Lock()
+	conn := r.quicConn
+	r.mu.Unlock()
+	return conn
+}
+
+func (r *fakeRelay) sendQUICDatagram(t *testing.T, flowID uint32, payload []byte) {
+	t.Helper()
+	conn := r.waitForQUICConn(t)
+	encoded, err := encodeDatagram(flowID, payload)
+	if err != nil {
+		t.Fatalf("encode fake datagram: %v", err)
+	}
+	if err := conn.SendDatagram(encoded); err != nil {
+		t.Fatalf("send fake datagram: %v", err)
+	}
+}
+
+func (r *fakeRelay) receiveQUICDatagram(t *testing.T) DatagramFrame {
+	t.Helper()
+	conn := r.waitForQUICConn(t)
+	ctx, cancel := context.WithTimeout(context.Background(), fakeRelayWait)
+	defer cancel()
+	data, err := conn.ReceiveDatagram(ctx)
+	if err != nil {
+		t.Fatalf("receive fake datagram: %v", err)
+	}
+	frame, err := decodeDatagram(data)
+	if err != nil {
+		t.Fatalf("decode fake datagram: %v", err)
+	}
+	return frame
 }
 
 func (r *fakeRelay) signalLocked() {
@@ -264,6 +384,10 @@ func (r *fakeRelay) handleChallenge(response http.ResponseWriter, request *http.
 		r.badRequest(response, fmt.Errorf("invalid challenge body: %+v", body))
 		return
 	}
+	if body.UDPEnabled && !r.options.udpEnabled {
+		r.fail(response, http.StatusForbidden, "udp_disabled", "UDP disabled")
+		return
+	}
 
 	r.mu.Lock()
 	r.challengeCount++
@@ -272,6 +396,7 @@ func (r *fakeRelay) handleChallenge(response http.ResponseWriter, request *http.
 	r.challengeID = challengeID
 	r.challengeMessage = message
 	r.challengeIdentity = body.Identity
+	r.challengeUDPEnabled = body.UDPEnabled
 	r.signalLocked()
 	r.mu.Unlock()
 	r.success(response, challengeResponse{
@@ -312,6 +437,7 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 	token := fmt.Sprintf("%s-token-%d", r.name, registration)
 	r.currentToken = token
 	r.connectLeaseLost = false
+	udpEnabled := r.challengeUDPEnabled
 	leaseDuration := r.options.initialLease
 	if registration > 1 {
 		leaseDuration = r.options.recoveredLease
@@ -337,12 +463,17 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 		_ = conn.Close()
 	}
 
-	r.success(response, registerResponse{
+	result := registerResponse{
 		Identity:    identity,
 		ExpiresAt:   time.Now().Add(leaseDuration),
 		AccessToken: token,
 		SNIPort:     sniPort,
-	})
+	}
+	if udpEnabled {
+		result.UDPEnabled = true
+		result.UDPAddr = net.JoinHostPort("localhost", strconv.Itoa(r.port))
+	}
+	r.success(response, result)
 }
 
 func (r *fakeRelay) handleRenew(response http.ResponseWriter, request *http.Request) {
@@ -852,16 +983,31 @@ func (r *fakeRelay) close() {
 		sessions = append(sessions, session.conn)
 		delete(r.sessions, id)
 	}
+	quicConn := r.quicConn
+	quicListener := r.quicListener
+	quicDone := r.quicDone
 	r.signalLocked()
 	r.mu.Unlock()
 	for _, conn := range sessions {
 		_ = conn.Close()
+	}
+	if quicConn != nil {
+		_ = quicConn.CloseWithError(0, "test closed")
+	}
+	if quicListener != nil {
+		_ = quicListener.Close()
 	}
 	_ = r.server.Close()
 	_ = r.listener.Close()
 	select {
 	case <-r.serveDone:
 	case <-time.After(fakeRelayWait):
+	}
+	if quicDone != nil {
+		select {
+		case <-quicDone:
+		case <-time.After(fakeRelayWait):
+		}
 	}
 }
 
@@ -1050,7 +1196,7 @@ func TestExposureTwoRelaysEndToEnd(t *testing.T) {
 
 func TestExposureRenewRotatesConnectAndSignerToken(t *testing.T) {
 	relay := newFakeRelay(t, "rotation", fakeRelayOptions{
-		initialLease:   150 * time.Millisecond,
+		initialLease:   750 * time.Millisecond,
 		renewedLease:   5 * time.Minute,
 		recoveredLease: 5 * time.Minute,
 	})

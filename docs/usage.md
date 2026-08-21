@@ -108,6 +108,7 @@ Only one goroutine should consume `Updates`. Use `Relays` for sorted point-in-ti
 
 - `connecting`: registration, renewal, or reverse-session setup is still in progress.
 - `ready`: the relay passed Protocol 8 and tenant-certificate checks, returned a valid `/v1/sign` signature for its certificate, and accepted at least one reverse HTTP/1.1 session.
+- `udp_ready`: the relay also authenticated a QUIC datagram backhaul and returned a public UDP address.
 - `failed`: that relay reached a terminal protocol, certificate, authentication, or transport error.
 
 `ready` validates the SDK-to-relay control, signing, and reverse-session paths. It does not actively send a request through the relay's public ingress. An external routing or firewall fault can therefore still make an individual public URL unreachable.
@@ -156,12 +157,28 @@ Use explicit relays instead of the defaults:
   127.0.0.1:3000
 ```
 
-Flags must appear before the target. Repeating `--relay` replaces the built-in relay set; canonical duplicates are removed while preserving input order. Without `--relay`, the CLI uses `portalite.DefaultRelays()`.
+Expose a UDP service without a TCP target:
+
+```sh
+./portalite expose \
+  --udp-target 127.0.0.1:5353
+```
+
+Expose TCP and UDP targets under the same relay lease:
+
+```sh
+./portalite expose \
+  --udp-target 127.0.0.1:5353 \
+  127.0.0.1:3000
+```
+
+Flags must appear before the optional TCP target. Repeating `--relay` replaces the built-in relay set; canonical duplicates are removed while preserving input order. Without `--relay`, the CLI uses `portalite.DefaultRelays()`. At least one TCP target or `--udp-target` is required.
 
 The command writes one line per ready relay to stdout:
 
 ```text
 URL https://my-service.relay.example
+UDP relay.example:40000
 ```
 
 Terminal relay failures are written to stderr. One failed relay does not terminate the command while another relay remains live or retrying. `SIGINT` and `SIGTERM` cancel sessions, unregister leases, and exit successfully after cleanup.
@@ -178,7 +195,7 @@ The CLI accepts:
 - `hostname:3000`
 - `[::1]:3000`
 
-A bare port binds the proxy target to `127.0.0.1`. URL schemes, paths, bare hosts, and ports outside 1–65535 are rejected.
+A bare port binds either proxy target to `127.0.0.1`. URL schemes, paths, bare hosts, and ports outside 1–65535 are rejected.
 
 ## Default relays
 
@@ -196,21 +213,54 @@ Relay availability is operational state, not a static guarantee. Consume `Update
 
 ## UDP support
 
-The full Portal server and reference tunnel contain an optional UDP proxy: registration requests `udp_enabled`, the relay allocates a public UDP port, and framed datagrams travel over a QUIC backhaul to the client before being forwarded to a local UDP target. A relay can disable this feature through policy or lack of a configured port range/backhaul.
+Set `UDPEnabled` when creating an exposure. Each supporting relay allocates a public UDP address and authenticates a separate QUIC DATAGRAM backhaul with the current lease token.
 
-Portalite intentionally implements only the ordinary HTTPS stream transport. Its public SDK and CLI do not expose UDP, QUIC, raw TCP port allocation, multi-hop, or ECH controls. Receiving the raw stream marker is treated as a terminal protocol error for that relay.
+```go
+listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
+	Identity:   identity,
+	Relays:     portalite.DefaultRelays(),
+	UDPEnabled: true,
+})
+
+udpRelays, err := listener.WaitDatagramReady(ctx)
+frame, err := listener.AcceptDatagram()
+frame.Payload = []byte("response")
+err = listener.SendDatagram(frame)
+```
+
+`RelayURL` and `FlowID` together identify a datagram's return path. Do not replace either field before calling `SendDatagram`. Payloads are copied at the SDK boundary.
+
+For a local UDP service, use `ProxyUDP`. Use `ProxyWithConfig` to proxy TCP and UDP concurrently:
+
+```go
+err := portalite.ProxyWithConfig(ctx, listener, portalite.ProxyConfig{
+	TCPTarget: "127.0.0.1:3000",
+	UDPTarget: "127.0.0.1:5353",
+})
+```
+
+The proxy maintains one connected local UDP socket per relay/flow pair, expires idle flows after five minutes, and caps active flows at 1024. QUIC token rotation reconnects the backhaul without changing the public UDP address.
+
+UDP is relay-dependent. A relay that returns `udp_disabled`, exhausts its UDP port pool, or rejects the datagram transport fails independently; other UDP-capable relays continue. At the time of writing, `s-h.day` and `gosunuts.xyz` advertise UDP support. Treat this as operational state rather than a permanent registry guarantee.
+
+Portalite still excludes raw TCP port allocation, multi-hop, and ECH controls. Receiving the raw stream marker remains a terminal protocol error for that relay.
 
 ## API summary
 
 ```go
 func Expose(context.Context, ExposeConfig) (*Exposure, error)
 func (e *Exposure) Accept() (net.Conn, error)
+func (e *Exposure) AcceptDatagram() (DatagramFrame, error)
+func (e *Exposure) SendDatagram(DatagramFrame) error
 func (e *Exposure) WaitReady(context.Context) ([]RelayStatus, error)
+func (e *Exposure) WaitDatagramReady(context.Context) ([]RelayStatus, error)
 func (e *Exposure) Updates() <-chan RelayStatus
 func (e *Exposure) Relays() []RelayStatus
 func (e *Exposure) Addr() net.Addr
 func (e *Exposure) Close() error
 func Proxy(context.Context, *Exposure, string) error
+func ProxyUDP(context.Context, *Exposure, string) error
+func ProxyWithConfig(context.Context, *Exposure, ProxyConfig) error
 ```
 
-`Proxy` is the sole accept consumer when used. Do not call `Accept` or run another server on the same exposure concurrently with `Proxy`.
+Each proxy helper owns the corresponding exposure consumer and closes the exposure on exit. Do not call `Accept` alongside `Proxy`, `AcceptDatagram` alongside `ProxyUDP`, or either accept API alongside `ProxyWithConfig`.

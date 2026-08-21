@@ -74,8 +74,9 @@ type identityRef struct {
 }
 
 type challengeRequest struct {
-	Identity identityRef `json:"identity"`
-	TTL      int         `json:"ttl,omitempty"`
+	Identity   identityRef `json:"identity"`
+	TTL        int         `json:"ttl,omitempty"`
+	UDPEnabled bool        `json:"udp_enabled,omitempty"`
 }
 
 type challengeResponse struct {
@@ -95,6 +96,8 @@ type registerResponse struct {
 	ExpiresAt   time.Time   `json:"expires_at"`
 	AccessToken string      `json:"access_token"`
 	SNIPort     int         `json:"sni_port,omitempty"`
+	UDPAddr     string      `json:"udp_addr,omitempty"`
+	UDPEnabled  bool        `json:"udp_enabled,omitempty"`
 }
 
 type renewRequest struct {

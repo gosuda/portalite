@@ -18,6 +18,7 @@ type RelayState string
 const (
 	RelayConnecting RelayState = "connecting"
 	RelayReady      RelayState = "ready"
+	RelayUDPReady   RelayState = "udp_ready"
 	RelayFailed     RelayState = "failed"
 )
 
@@ -25,14 +26,16 @@ const (
 type RelayStatus struct {
 	RelayURL  string
 	PublicURL string
+	UDPAddr   string
 	State     RelayState
 	Err       error
 }
 
 // ExposeConfig configures a multi-relay exposure.
 type ExposeConfig struct {
-	Relays   []string
-	Identity Identity
+	Relays     []string
+	Identity   Identity
+	UDPEnabled bool
 }
 
 // Exposure is a net.Listener that fans in tenant connections from all relays.
@@ -41,21 +44,24 @@ type Exposure struct {
 	cancel context.CancelFunc
 	addr   exposureAddr
 
-	accepted chan net.Conn
-	updates  chan RelayStatus
+	accepted  chan net.Conn
+	updates   chan RelayStatus
+	datagrams chan DatagramFrame
 
 	mu           sync.RWMutex
 	statuses     map[string]RelayStatus
 	relayCount   int
 	failedCount  int
+	udpEnabled   bool
 	closing      bool
 	allFailed    chan struct{}
 	stateChanged chan struct{}
 	failedOnce   sync.Once
 
-	supervisors sync.WaitGroup
-	cleanupMu   sync.Mutex
-	cleanupErrs []error
+	supervisors      sync.WaitGroup
+	cleanupMu        sync.Mutex
+	cleanupErrs      []error
+	relaySupervisors map[string]*relaySupervisor
 
 	closeOnce       sync.Once
 	closeDone       chan struct{}
@@ -100,6 +106,7 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 		if err != nil {
 			return nil, fmt.Errorf("portalite: relay %s: %w", relayURL, err)
 		}
+		supervisor.udpEnabled = cfg.UDPEnabled
 		supervisorList = append(supervisorList, supervisor)
 	}
 
@@ -108,24 +115,34 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 	if acceptCapacity < 1 {
 		acceptCapacity = 1
 	}
+	datagramCapacity := datagramQueuePerRelay * len(relays)
+	if datagramCapacity < 1 {
+		datagramCapacity = 1
+	}
 	e := &Exposure{
-		ctx:             exposureCtx,
-		cancel:          cancel,
-		addr:            exposureAddr{address: cfg.Identity.Address()},
-		accepted:        make(chan net.Conn, acceptCapacity),
-		updates:         make(chan RelayStatus, 3*len(relays)),
-		statuses:        make(map[string]RelayStatus, len(relays)),
-		relayCount:      len(relays),
-		allFailed:       make(chan struct{}),
-		stateChanged:    make(chan struct{}),
-		closeDone:       make(chan struct{}),
-		parentWatchStop: make(chan struct{}),
+		ctx:              exposureCtx,
+		cancel:           cancel,
+		addr:             exposureAddr{address: cfg.Identity.Address()},
+		accepted:         make(chan net.Conn, acceptCapacity),
+		updates:          make(chan RelayStatus, 4*len(relays)),
+		datagrams:        make(chan DatagramFrame, datagramCapacity),
+		statuses:         make(map[string]RelayStatus, len(relays)),
+		relayCount:       len(relays),
+		udpEnabled:       cfg.UDPEnabled,
+		allFailed:        make(chan struct{}),
+		stateChanged:     make(chan struct{}),
+		relaySupervisors: make(map[string]*relaySupervisor, len(relays)),
+		closeDone:        make(chan struct{}),
+		parentWatchStop:  make(chan struct{}),
 	}
 
 	for _, relayURL := range relays {
 		status := RelayStatus{RelayURL: relayURL, State: RelayConnecting}
 		e.statuses[relayURL] = status
 		e.updates <- status
+	}
+	for _, supervisor := range supervisorList {
+		e.relaySupervisors[supervisor.relayURL] = supervisor
 	}
 
 	for _, supervisor := range supervisorList {
@@ -144,9 +161,12 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 
 func (e *Exposure) runSupervisor(supervisor *relaySupervisor) {
 	defer e.supervisors.Done()
-	runErr, cleanupErr := supervisor.run(e.ctx,
+	runErr, cleanupErr := supervisor.run(
+		e.ctx,
 		func(publicURL string) { e.markReady(supervisor.relayURL, publicURL) },
+		func(udpAddr string) { e.markDatagramReady(supervisor.relayURL, udpAddr) },
 		e.offer,
+		e.offerDatagram,
 	)
 	if cleanupErr != nil {
 		e.cleanupMu.Lock()
@@ -169,6 +189,20 @@ func (e *Exposure) offer(relayCtx context.Context, conn net.Conn) bool {
 		return false
 	case e.accepted <- conn:
 		return true
+	}
+}
+
+func (e *Exposure) offerDatagram(relayCtx context.Context, frame DatagramFrame) bool {
+	frame.Payload = append([]byte(nil), frame.Payload...)
+	select {
+	case <-relayCtx.Done():
+		return false
+	case <-e.ctx.Done():
+		return false
+	case e.datagrams <- frame:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -213,6 +247,24 @@ func (e *Exposure) markFailed(relayURL string, relayErr error) {
 	if allFailed {
 		e.failedOnce.Do(func() { close(e.allFailed) })
 		e.drainAccepted()
+	}
+}
+
+func (e *Exposure) markDatagramReady(relayURL, udpAddr string) {
+	e.mu.Lock()
+	status, exists := e.statuses[relayURL]
+	if !exists || e.closing || e.ctx.Err() != nil || status.State == RelayFailed {
+		e.mu.Unlock()
+		return
+	}
+	announce := udpAddr != "" && status.UDPAddr != udpAddr
+	status.UDPAddr = udpAddr
+	e.statuses[relayURL] = status
+	e.notifyStateChangedLocked()
+	e.mu.Unlock()
+	if announce {
+		status.State = RelayUDPReady
+		e.updates <- status
 	}
 }
 
@@ -272,6 +324,103 @@ func (e *Exposure) WaitReady(ctx context.Context) ([]RelayStatus, error) {
 		ready := make([]RelayStatus, 0, e.relayCount-e.failedCount)
 		for _, status := range e.statuses {
 			if status.State == RelayReady {
+				ready = append(ready, status)
+			}
+		}
+		closed := e.closing || e.ctx.Err() != nil
+		failed := e.failedCount == e.relayCount
+		changed := e.stateChanged
+		e.mu.RUnlock()
+
+		if len(ready) != 0 {
+			sort.Slice(ready, func(i, j int) bool { return ready[i].RelayURL < ready[j].RelayURL })
+			return ready, nil
+		}
+		if closed {
+			return nil, net.ErrClosed
+		}
+		if failed {
+			return nil, ErrNoRelays
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-e.ctx.Done():
+			return nil, net.ErrClosed
+		case <-changed:
+		}
+	}
+}
+
+// AcceptDatagram returns the next UDP datagram from any connected UDP relay.
+func (e *Exposure) AcceptDatagram() (DatagramFrame, error) {
+	if e == nil || !e.udpEnabled {
+		return DatagramFrame{}, net.ErrClosed
+	}
+	for {
+		closed, failed := e.terminalState()
+		if closed {
+			return DatagramFrame{}, net.ErrClosed
+		}
+		if failed {
+			return DatagramFrame{}, ErrNoRelays
+		}
+		select {
+		case <-e.ctx.Done():
+			return DatagramFrame{}, net.ErrClosed
+		case <-e.allFailed:
+			closed, _ = e.terminalState()
+			if closed {
+				return DatagramFrame{}, net.ErrClosed
+			}
+			return DatagramFrame{}, ErrNoRelays
+		case frame := <-e.datagrams:
+			frame.Payload = append([]byte(nil), frame.Payload...)
+			return frame, nil
+		}
+	}
+}
+
+// SendDatagram sends a response through the relay and flow identified by frame.
+func (e *Exposure) SendDatagram(frame DatagramFrame) error {
+	if e == nil || !e.udpEnabled {
+		return net.ErrClosed
+	}
+	e.mu.RLock()
+	supervisor := e.relaySupervisors[frame.RelayURL]
+	closed := e.closing || e.ctx.Err() != nil
+	failed := e.failedCount == e.relayCount
+	e.mu.RUnlock()
+	if closed {
+		return net.ErrClosed
+	}
+	if failed {
+		return ErrNoRelays
+	}
+	if supervisor == nil {
+		return errors.New("portalite: datagram frame references an unknown relay")
+	}
+	frame.Payload = append([]byte(nil), frame.Payload...)
+	return supervisor.sendDatagram(frame)
+}
+
+// WaitDatagramReady waits until at least one relay has an authenticated QUIC
+// datagram backhaul. It does not consume Updates or AcceptDatagram.
+func (e *Exposure) WaitDatagramReady(ctx context.Context) ([]RelayStatus, error) {
+	if e == nil {
+		return nil, net.ErrClosed
+	}
+	if ctx == nil {
+		return nil, errors.New("portalite: context is nil")
+	}
+	if !e.udpEnabled {
+		return nil, errors.New("portalite: UDP is not enabled")
+	}
+	for {
+		e.mu.RLock()
+		ready := make([]RelayStatus, 0, e.relayCount-e.failedCount)
+		for _, status := range e.statuses {
+			if status.UDPAddr != "" && status.State != RelayFailed {
 				ready = append(ready, status)
 			}
 		}

@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/gosuda/keyless_tls/keyless"
+
+	"github.com/quic-go/quic-go"
 )
 
 const reverseSessionSlots = 2
@@ -97,6 +99,8 @@ type relayLease struct {
 	token          string
 	expiresAt      time.Time
 	publicURL      string
+	udpAddr        string
+	sniPort        int
 	tlsConfig      *tls.Config
 	signer         *keyless.RemoteSigner
 	generation     uint64
@@ -112,6 +116,7 @@ type relaySupervisor struct {
 	publicHostname string
 	identity       Identity
 	timings        relayTimings
+	udpEnabled     bool
 
 	controlTLS       *tls.Config
 	certificateChain []byte
@@ -122,6 +127,9 @@ type relaySupervisor struct {
 	lease               relayLease
 	nextLeaseGeneration uint64
 	signerWG            sync.WaitGroup
+
+	datagramMu   sync.RWMutex
+	datagramConn *quic.Conn
 }
 
 type terminalRelayError struct{ err error }
@@ -269,7 +277,13 @@ func newRelaySupervisor(relayURL string, identity Identity, timings relayTimings
 
 // run owns the complete lifecycle of one relay. Its two results deliberately
 // separate a terminal relay failure from best-effort shutdown failures.
-func (s *relaySupervisor) run(ctx context.Context, ready func(string), offer func(context.Context, net.Conn) bool) (runErr, cleanupErr error) {
+func (s *relaySupervisor) run(
+	ctx context.Context,
+	ready func(string),
+	datagramReady func(string),
+	offer func(context.Context, net.Conn) bool,
+	offerDatagram func(context.Context, DatagramFrame) bool,
+) (runErr, cleanupErr error) {
 	defer func() {
 		cleanupErr = s.shutdown()
 	}()
@@ -314,7 +328,7 @@ func (s *relaySupervisor) run(ctx context.Context, ready func(string), offer fun
 			}
 		}
 
-		err := s.runLease(ctx, ready, offer)
+		err := s.runLease(ctx, ready, datagramReady, offer, offerDatagram)
 		if ctx.Err() != nil {
 			return ctx.Err(), nil
 		}
@@ -452,8 +466,9 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 	requestIdentity := identityRef{Name: s.identity.Name(), Address: s.identity.Address()}
 	var challenge challengeResponse
 	if err := s.doAPI(ctx, http.MethodPost, pathRegisterChallenge, challengeRequest{
-		Identity: requestIdentity,
-		TTL:      s.timings.ttlSeconds(),
+		Identity:   requestIdentity,
+		TTL:        s.timings.ttlSeconds(),
+		UDPEnabled: s.udpEnabled,
 	}, &challenge); err != nil {
 		return classifyRelayError(err, false)
 	}
@@ -513,6 +528,19 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 	if responseName != requestIdentity.Name || responseAddress != requestIdentity.Address {
 		return invalid(errors.New("register response identity does not match requested identity"))
 	}
+	udpAddr := ""
+	if s.udpEnabled {
+		if !response.UDPEnabled {
+			return invalid(errors.New("register response did not enable UDP"))
+		}
+		if response.SNIPort <= 0 {
+			return invalid(errors.New("register response has no sni_port for UDP"))
+		}
+		udpAddr, err = NormalizeTarget(response.UDPAddr)
+		if err != nil {
+			return invalid(fmt.Errorf("register response has invalid udp_addr: %w", err))
+		}
+	}
 
 	publicURL := "https://" + s.publicHostname
 	if response.SNIPort > 0 && response.SNIPort != 443 {
@@ -542,6 +570,8 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 		token:      responseToken,
 		expiresAt:  response.ExpiresAt,
 		publicURL:  publicURL,
+		udpAddr:    udpAddr,
+		sniPort:    response.SNIPort,
 		tlsConfig:  tlsConfig,
 		signer:     signer,
 		generation: s.nextLeaseGeneration,
@@ -613,29 +643,45 @@ func (s *relaySupervisor) newRemoteSigner(headers func() http.Header) (*keyless.
 	}, s.certificateChain)
 }
 
-func (s *relaySupervisor) runLease(ctx context.Context, ready func(string), offer func(context.Context, net.Conn) bool) error {
+func (s *relaySupervisor) runLease(
+	ctx context.Context,
+	ready func(string),
+	datagramReady func(string),
+	offer func(context.Context, net.Conn) bool,
+	offerDatagram func(context.Context, DatagramFrame) bool,
+) error {
 	leaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	results := make(chan error, reverseSessionSlots+1)
+	workerCount := reverseSessionSlots + 1
+	if s.udpEnabled {
+		workerCount++
+	}
+	results := make(chan error, workerCount)
 	var wg sync.WaitGroup
+	startWorker := func(run func() error) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- run()
+		}()
+	}
+
 	var readyOnce sync.Once
 	announceReady := func() {
 		readyOnce.Do(func() { ready(s.currentPublicURL()) })
 	}
-
 	for range reverseSessionSlots {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			results <- s.runReverseSlot(leaseCtx, announceReady, offer)
-		}()
+		startWorker(func() error {
+			return s.runReverseSlot(leaseCtx, announceReady, offer)
+		})
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		results <- s.runRenewLoop(leaseCtx)
-	}()
+	startWorker(func() error { return s.runRenewLoop(leaseCtx) })
+	if s.udpEnabled {
+		startWorker(func() error {
+			return s.runDatagramLoop(leaseCtx, datagramReady, offerDatagram)
+		})
+	}
 
 	var firstResult error
 	haveFirstResult := false
@@ -647,15 +693,12 @@ func (s *relaySupervisor) runLease(ctx context.Context, ready func(string), offe
 	cancel()
 	wg.Wait()
 
-	var workerResults [reverseSessionSlots + 1]error
-	resultCount := 0
+	workerResults := make([]error, 0, workerCount)
 	if haveFirstResult {
-		workerResults[0] = firstResult
-		resultCount = 1
+		workerResults = append(workerResults, firstResult)
 	}
-	for resultCount < len(workerResults) {
-		workerResults[resultCount] = <-results
-		resultCount++
+	for len(workerResults) < workerCount {
+		workerResults = append(workerResults, <-results)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -682,6 +725,142 @@ func (s *relaySupervisor) runLease(ctx context.Context, ready func(string), offe
 		return transient
 	}
 	return context.Canceled
+}
+
+func (s *relaySupervisor) runDatagramLoop(
+	ctx context.Context,
+	ready func(string),
+	offer func(context.Context, DatagramFrame) bool,
+) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			s.clearDatagramConn(nil, "lease stopped")
+			return err
+		}
+		token, generation, sniPort, udpAddr, tlsConfig, ok := s.currentDatagramLease()
+		if !ok {
+			return errLeaseRefresh
+		}
+		address := net.JoinHostPort(s.hostname, fmt.Sprint(sniPort))
+		conn, err := dialQUICBackhaul(ctx, address, tlsConfig, token)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			var rejection *quicBackhaulRejection
+			if errors.As(err, &rejection) {
+				code := strings.ToLower(strings.TrimSpace(rejection.Code))
+				switch code {
+				case "lease_not_found", "lease_rejected", "unauthorized":
+					if s.reverseConnectRequestStale(token, generation) {
+						continue
+					}
+					return errLeaseRefresh
+				case "transport_mismatch":
+					return terminalRelay(err)
+				}
+			}
+			if !waitForRelayRetry(ctx, s.timings.retryWait) {
+				return ctx.Err()
+			}
+			continue
+		}
+
+		s.installDatagramConn(conn)
+		if ready != nil {
+			ready(udpAddr)
+		}
+		for {
+			data, receiveErr := conn.ReceiveDatagram(ctx)
+			if receiveErr != nil {
+				s.clearDatagramConn(conn, "backhaul disconnected")
+				if ready != nil {
+					ready("")
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				break
+			}
+			frame, decodeErr := decodeDatagram(data)
+			if decodeErr != nil {
+				continue
+			}
+			frame.RelayURL = s.relayURL
+			frame.UDPAddr = udpAddr
+			if offer != nil {
+				offer(ctx, frame)
+			}
+		}
+		if !waitForRelayRetry(ctx, s.timings.retryWait) {
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *relaySupervisor) currentDatagramLease() (
+	token string,
+	generation uint64,
+	sniPort int,
+	udpAddr string,
+	tlsConfig *tls.Config,
+	ok bool,
+) {
+	s.leaseMu.RLock()
+	token = s.lease.token
+	generation = s.lease.generation
+	sniPort = s.lease.sniPort
+	udpAddr = s.lease.udpAddr
+	ok = s.udpEnabled && token != "" && sniPort > 0 && udpAddr != "" && s.controlTLS != nil
+	if ok {
+		tlsConfig = s.controlTLS.Clone()
+	}
+	s.leaseMu.RUnlock()
+	return
+}
+
+func (s *relaySupervisor) installDatagramConn(conn *quic.Conn) {
+	s.datagramMu.Lock()
+	old := s.datagramConn
+	s.datagramConn = conn
+	s.datagramMu.Unlock()
+	if old != nil && old != conn {
+		_ = old.CloseWithError(0, "replaced")
+	}
+}
+
+func (s *relaySupervisor) clearDatagramConn(expected *quic.Conn, reason string) {
+	s.datagramMu.Lock()
+	conn := s.datagramConn
+	if expected == nil || conn == expected {
+		s.datagramConn = nil
+	} else {
+		conn = nil
+	}
+	s.datagramMu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, reason)
+	}
+}
+
+func (s *relaySupervisor) sendDatagram(frame DatagramFrame) error {
+	if !s.udpEnabled {
+		return errors.New("portalite: UDP is not enabled for relay")
+	}
+	encoded, err := encodeDatagram(frame.FlowID, frame.Payload)
+	if err != nil {
+		return err
+	}
+	s.datagramMu.RLock()
+	conn := s.datagramConn
+	s.datagramMu.RUnlock()
+	if conn == nil {
+		return errDatagramNotReady
+	}
+	if err := conn.SendDatagram(encoded); err != nil {
+		return fmt.Errorf("send QUIC datagram: %w", err)
+	}
+	return nil
 }
 
 func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offer func(context.Context, net.Conn) bool) error {
@@ -970,6 +1149,7 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 		s.lease.tokenUncertain = false
 		s.lease.generation = s.nextLeaseGeneration
 		s.leaseMu.Unlock()
+		s.clearDatagramConn(nil, "lease renewed")
 	}
 }
 
@@ -1078,6 +1258,7 @@ func (s *relaySupervisor) unregisterToken(ctx context.Context, token string) err
 }
 
 func (s *relaySupervisor) shutdown() error {
+	s.clearDatagramConn(nil, "relay shutting down")
 	token := s.currentToken()
 	var errs []error
 	if token != "" {
@@ -1098,6 +1279,7 @@ func (s *relaySupervisor) shutdown() error {
 }
 
 func (s *relaySupervisor) discardLostLease() {
+	s.clearDatagramConn(nil, "lease lost")
 	s.signerWG.Wait()
 	if signer := s.clearLease(); signer != nil {
 		_ = signer.Close()
