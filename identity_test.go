@@ -306,13 +306,13 @@ func TestNormalizeRelaysBoundariesAndDeduplication(t *testing.T) {
 
 func TestDefaultRelaysOrderAndDefensiveCopy(t *testing.T) {
 	want := []string{
-		"https://gosunuts.xyz",
+		"https://rly.best",
 		"https://portal.thumbgo.kr",
 		"https://portal.rabbitson87.dev",
-		"https://s-h.day",
 		"https://portal.dawnfullstack.com",
-		"https://kakashit.org",
 		"https://portal.damn.it.com",
+		"https://s-h.day",
+		"https://gosunuts.xyz",
 	}
 	first := DefaultRelays()
 	if fmt.Sprint(first) != fmt.Sprint(want) {

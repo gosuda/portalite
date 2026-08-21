@@ -1,13 +1,13 @@
 package portalite
 
 var defaultRelays = [...]string{
-	"https://gosunuts.xyz",
+	"https://rly.best",
 	"https://portal.thumbgo.kr",
 	"https://portal.rabbitson87.dev",
-	"https://s-h.day",
 	"https://portal.dawnfullstack.com",
-	"https://kakashit.org",
 	"https://portal.damn.it.com",
+	"https://s-h.day",
+	"https://gosunuts.xyz",
 }
 
 // DefaultRelays returns the canonical built-in relay URLs in registry order.

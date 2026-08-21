@@ -153,13 +153,13 @@ A bare port binds the proxy target to `127.0.0.1`. URL schemes, paths, bare host
 
 `portalite.DefaultRelays()` returns a defensive copy of the built-in registry:
 
-1. `https://gosunuts.xyz`
+1. `https://rly.best`
 2. `https://portal.thumbgo.kr`
 3. `https://portal.rabbitson87.dev`
-4. `https://s-h.day`
-5. `https://portal.dawnfullstack.com`
-6. `https://kakashit.org`
-7. `https://portal.damn.it.com`
+4. `https://portal.dawnfullstack.com`
+5. `https://portal.damn.it.com`
+6. `https://s-h.day`
+7. `https://gosunuts.xyz`
 
 Relay availability is operational state, not a static guarantee. Consume `Updates`, call `WaitReady`, or inspect `Relays` instead of assuming every configured relay is reachable.
 
