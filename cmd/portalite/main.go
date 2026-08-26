@@ -224,7 +224,7 @@ func loadOrCreateIdentityWith(
 		if parseErr != nil {
 			return portalite.Identity{}, fmt.Errorf("read identity %q: %w", path, parseErr)
 		}
-		if err := checkIdentityName(identity, normalizedRequestedName); err != nil {
+		if err := checkIdentityName(identity, normalizedRequestedName, path); err != nil {
 			return portalite.Identity{}, &identityUsageError{err: err}
 		}
 		return identity, nil
@@ -347,7 +347,7 @@ func readIdentityAfterCreateRace(path, requestedName string) (portalite.Identity
 
 		winnerIdentity, parseErr := portalite.ParseIdentity(winner)
 		if parseErr == nil {
-			if nameErr := checkIdentityName(winnerIdentity, requestedName); nameErr != nil {
+			if nameErr := checkIdentityName(winnerIdentity, requestedName, path); nameErr != nil {
 				return portalite.Identity{}, false, &identityUsageError{err: nameErr}
 			}
 			return winnerIdentity, false, nil
@@ -378,12 +378,12 @@ func normalizeRequestedIdentityName(requestedName string) (string, error) {
 	return identity.Name(), nil
 }
 
-func checkIdentityName(identity portalite.Identity, requestedName string) error {
+func checkIdentityName(identity portalite.Identity, requestedName, path string) error {
 	if requestedName == "" {
 		return nil
 	}
 	if requestedName != identity.Name() {
-		return fmt.Errorf("identity name %q does not match existing identity %q", requestedName, identity.Name())
+		return fmt.Errorf("identity name %q does not match existing identity %q in %q (delete the file or use --identity to specify a different path)", requestedName, identity.Name(), path)
 	}
 	return nil
 }

@@ -290,7 +290,7 @@ func TestRunIdentityCreationReuseAndNameConflict(t *testing.T) {
 	if exit := run(ctx, conflictArgs, &stdout, &stderr); exit != 2 {
 		t.Fatalf("name conflict exit = %d, want 2", exit)
 	}
-	wantError := "portalite: identity name \"other-name\" does not match existing identity \"reused-name\"\n" + usageLine
+	wantError := fmt.Sprintf("portalite: identity name \"other-name\" does not match existing identity \"reused-name\" in %q (delete the file or use --identity to specify a different path)\n%s", identityPath, usageLine)
 	if got := stderr.String(); got != wantError {
 		t.Fatalf("name conflict stderr = %q, want %q", got, wantError)
 	}
@@ -449,7 +449,7 @@ func TestIdentityCreateRaceUsesWinner(t *testing.T) {
 				if !errors.As(err, &usageErr) {
 					t.Fatalf("error = %v, want identity usage conflict", err)
 				}
-				want := `identity name "loser-name" does not match existing identity "winner-name"`
+				want := fmt.Sprintf(`identity name "loser-name" does not match existing identity "winner-name" in %q (delete the file or use --identity to specify a different path)`, identityPath)
 				if err.Error() != want {
 					t.Fatalf("error = %q, want %q", err, want)
 				}
