@@ -763,11 +763,17 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		r.registrations++
 		name, address := r.identityName, r.identityAddress
 		r.mu.Unlock()
+		expiresAt := time.Now().Add(5 * time.Minute)
 		r.writeOK(w, map[string]any{
 			"identity":     map[string]string{"name": name, "address": address},
-			"expires_at":   time.Now().Add(5 * time.Minute),
+			"expires_at":   expiresAt,
 			"access_token": "cli-test-token",
-			"sni_port":     r.port,
+			"reverse_endpoint": map[string]any{
+				"url":        r.url + "/sdk/connect",
+				"capability": "cli-test-capability",
+				"expires_at": expiresAt,
+			},
+			"sni_port": r.port,
 		})
 	case "/sdk/renew":
 		var input struct {
@@ -780,7 +786,16 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		if input.AccessToken != "cli-test-token" || input.TTL != 120 {
 			r.recordFailure(fmt.Errorf("unexpected renew request: %+v", input))
 		}
-		r.writeOK(w, map[string]any{"expires_at": time.Now().Add(5 * time.Minute), "access_token": "cli-test-token"})
+		expiresAt := time.Now().Add(5 * time.Minute)
+		r.writeOK(w, map[string]any{
+			"expires_at":   expiresAt,
+			"access_token": "cli-test-token",
+			"reverse_endpoint": map[string]any{
+				"url":        r.url + "/sdk/connect",
+				"capability": "cli-test-capability",
+				"expires_at": expiresAt,
+			},
+		})
 	case "/sdk/unregister":
 		var input struct {
 			AccessToken string `json:"access_token"`
@@ -853,8 +868,8 @@ func (r *cliTestRelay) handleSign(w http.ResponseWriter, request *http.Request) 
 }
 
 func (r *cliTestRelay) handleConnect(w http.ResponseWriter, request *http.Request) {
-	if token := request.Header.Get("X-Portal-Access-Token"); token != "cli-test-token" {
-		r.recordFailure(fmt.Errorf("connect token = %q", token))
+	if capability := request.Header.Get("X-Portal-Reverse-Capability"); capability != "cli-test-capability" {
+		r.recordFailure(fmt.Errorf("connect capability = %q", capability))
 	}
 	if !strings.EqualFold(request.Header.Get("Upgrade"), "raw") || !strings.Contains(strings.ToLower(request.Header.Get("Connection")), "upgrade") {
 		r.recordFailure(fmt.Errorf("unexpected connect upgrade headers: %v", request.Header))

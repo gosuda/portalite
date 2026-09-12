@@ -8,7 +8,7 @@ import (
 )
 
 // ProtocolVersion is the relay SDK protocol version implemented by Portalite.
-const ProtocolVersion = "8"
+const ProtocolVersion = "9"
 
 const (
 	pathDomain            = "/sdk/domain"
@@ -18,7 +18,8 @@ const (
 	pathUnregister        = "/sdk/unregister"
 	pathConnect           = "/sdk/connect"
 
-	accessTokenHeader = "X-Portal-Access-Token"
+	accessTokenHeader       = "X-Portal-Access-Token"
+	reverseCapabilityHeader = "X-Portal-Reverse-Capability"
 
 	markerKeepalive byte = 0x00
 	markerRaw       byte = 0x01 // Recognized only so the unsupported raw transport can be rejected.
@@ -91,13 +92,23 @@ type registerRequest struct {
 	SIWESignature string `json:"siwe_signature"`
 }
 
+// reverseEndpoint authorizes one class of operation: opening reverse streams.
+// The capability is opaque to SDK callers and cannot mutate the owning lease.
+type reverseEndpoint struct {
+	URL        string    `json:"url"`
+	Capability string    `json:"capability"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Overlay    bool      `json:"overlay,omitempty"`
+}
+
 type registerResponse struct {
-	Identity    identityRef `json:"identity"`
-	ExpiresAt   time.Time   `json:"expires_at"`
-	AccessToken string      `json:"access_token"`
-	SNIPort     int         `json:"sni_port,omitempty"`
-	UDPAddr     string      `json:"udp_addr,omitempty"`
-	UDPEnabled  bool        `json:"udp_enabled,omitempty"`
+	Identity        identityRef     `json:"identity"`
+	ExpiresAt       time.Time       `json:"expires_at"`
+	AccessToken     string          `json:"access_token"`
+	ReverseEndpoint reverseEndpoint `json:"reverse_endpoint"`
+	SNIPort         int             `json:"sni_port,omitempty"`
+	UDPAddr         string          `json:"udp_addr,omitempty"`
+	UDPEnabled      bool            `json:"udp_enabled,omitempty"`
 }
 
 type renewRequest struct {
@@ -106,8 +117,9 @@ type renewRequest struct {
 }
 
 type renewResponse struct {
-	ExpiresAt   time.Time `json:"expires_at"`
-	AccessToken string    `json:"access_token"`
+	ExpiresAt       time.Time       `json:"expires_at"`
+	AccessToken     string          `json:"access_token"`
+	ReverseEndpoint reverseEndpoint `json:"reverse_endpoint"`
 }
 
 type unregisterRequest struct {

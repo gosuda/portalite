@@ -101,6 +101,7 @@ type relayLease struct {
 	publicURL      string
 	udpAddr        string
 	sniPort        int
+	reverse        reverseEndpoint
 	tlsConfig      *tls.Config
 	signer         *keyless.RemoteSigner
 	generation     uint64
@@ -149,7 +150,7 @@ func (e *malformedRelayResponseError) Unwrap() error { return e.err }
 var errReverseResponseHeadTooLarge = errors.New("reverse upgrade response head exceeds 1 MiB")
 
 type reverseUpgradeError struct {
-	token      string
+	capability string
 	generation uint64
 	err        error
 }
@@ -514,6 +515,10 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 	if !response.ExpiresAt.After(time.Now()) {
 		return invalid(errors.New("register response lease is expired"))
 	}
+	reverse, err := s.validateReverseEndpoint(response.ReverseEndpoint, response.ExpiresAt)
+	if err != nil {
+		return invalid(err)
+	}
 	if response.SNIPort < 0 || response.SNIPort > 65535 {
 		return invalid(fmt.Errorf("register response has invalid sni_port %d", response.SNIPort))
 	}
@@ -572,12 +577,42 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 		publicURL:  publicURL,
 		udpAddr:    udpAddr,
 		sniPort:    response.SNIPort,
+		reverse:    reverse,
 		tlsConfig:  tlsConfig,
 		signer:     signer,
 		generation: s.nextLeaseGeneration,
 	}
 	s.leaseMu.Unlock()
 	return nil
+}
+
+// validateReverseEndpoint checks that a relay-issued reverse endpoint is
+// well-formed and directly reachable at the relay origin. Overlay endpoints
+// are rejected because Portalite does not implement the overlay transport.
+func (s *relaySupervisor) validateReverseEndpoint(endpoint reverseEndpoint, leaseExpiresAt time.Time) (reverseEndpoint, error) {
+	endpoint.URL = strings.TrimSpace(endpoint.URL)
+	endpoint.Capability = strings.TrimSpace(endpoint.Capability)
+	if endpoint.URL == "" || endpoint.Capability == "" {
+		return reverseEndpoint{}, errors.New("relay returned an incomplete reverse endpoint")
+	}
+	parsed, err := url.Parse(endpoint.URL)
+	if err != nil || parsed.Host == "" || !strings.EqualFold(parsed.Scheme, "https") {
+		return reverseEndpoint{}, errors.New("relay returned an invalid reverse endpoint URL")
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.EscapedPath() != pathConnect {
+		return reverseEndpoint{}, errors.New("relay returned an invalid reverse endpoint target")
+	}
+	if endpoint.Overlay {
+		return reverseEndpoint{}, errors.New("relay returned an overlay reverse endpoint but overlay is unsupported")
+	}
+	if !strings.EqualFold(parsed.Host, s.authority) {
+		return reverseEndpoint{}, fmt.Errorf("relay reverse endpoint %s does not match the relay URL; align the relay's public URL with the address clients dial", endpoint.URL)
+	}
+	if !endpoint.ExpiresAt.After(time.Now()) || endpoint.ExpiresAt.After(leaseExpiresAt) {
+		return reverseEndpoint{}, errors.New("relay returned an invalid reverse endpoint expiry")
+	}
+	endpoint.URL = parsed.String()
+	return endpoint, nil
 }
 
 func (s *relaySupervisor) buildTenantTLS(initialToken string) (*keyless.RemoteSigner, *tls.Config, error) {
@@ -752,7 +787,7 @@ func (s *relaySupervisor) runDatagramLoop(
 				code := strings.ToLower(strings.TrimSpace(rejection.Code))
 				switch code {
 				case "lease_not_found", "lease_rejected", "unauthorized":
-					if s.reverseConnectRequestStale(token, generation) {
+					if s.datagramTokenStale(token, generation) {
 						continue
 					}
 					return errLeaseRefresh
@@ -875,7 +910,7 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 			}
 			var upgradeErr *reverseUpgradeError
 			if errors.As(err, &upgradeErr) && isLostLeaseError(err) &&
-				s.reverseConnectRequestStale(upgradeErr.token, upgradeErr.generation) {
+				s.reverseConnectRequestStale(upgradeErr.capability, upgradeErr.generation) {
 				if !waitForRelayRetry(ctx, s.timings.retryWait) {
 					return ctx.Err()
 				}
@@ -928,6 +963,18 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 }
 
 func (s *relaySupervisor) openReverseSession(ctx context.Context) (net.Conn, error) {
+	reverse, generation, ok := s.currentReverseEndpoint()
+	if !ok {
+		return nil, errLeaseRefresh
+	}
+	if !reverse.ExpiresAt.After(time.Now()) {
+		return nil, errLeaseRefresh
+	}
+	reverseURL, err := url.Parse(reverse.URL)
+	if err != nil {
+		return nil, fmt.Errorf("parse reverse endpoint: %w", err)
+	}
+
 	dialer := &net.Dialer{Timeout: s.timings.dialTimeout, KeepAlive: 30 * time.Second}
 	raw, err := dialer.DialContext(ctx, "tcp", s.dialAddress)
 	if err != nil {
@@ -955,8 +1002,8 @@ func (s *relaySupervisor) openReverseSession(ctx context.Context) (net.Conn, err
 	}
 	request := &http.Request{
 		Method:     http.MethodGet,
-		URL:        &url.URL{Scheme: "https", Host: s.authority, Path: pathConnect},
-		Host:       s.authority,
+		URL:        reverseURL,
+		Host:       reverseURL.Host,
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,
@@ -964,11 +1011,7 @@ func (s *relaySupervisor) openReverseSession(ctx context.Context) (net.Conn, err
 	}
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "raw")
-	token, _, generation := s.currentTokenExpiryAndGeneration()
-	if token == "" {
-		return nil, errLeaseRefresh
-	}
-	request.Header.Set(accessTokenHeader, token)
+	request.Header.Set(reverseCapabilityHeader, reverse.Capability)
 	if err := request.Write(conn); err != nil {
 		return nil, fmt.Errorf("write reverse upgrade request: %w", err)
 	}
@@ -986,7 +1029,7 @@ func (s *relaySupervisor) openReverseSession(ctx context.Context) (net.Conn, err
 	headReader.disableBound()
 	if response.StatusCode != http.StatusSwitchingProtocols {
 		apiErr := decodeHTTPAPIError(response)
-		return nil, &reverseUpgradeError{token: token, generation: generation, err: apiErr}
+		return nil, &reverseUpgradeError{capability: reverse.Capability, generation: generation, err: apiErr}
 	}
 	if response.Body != nil {
 		_ = response.Body.Close()
@@ -1137,6 +1180,10 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 		if !response.ExpiresAt.After(time.Now()) {
 			return terminalRelay(errors.New("renew response lease is expired"))
 		}
+		reverse, err := s.validateReverseEndpoint(response.ReverseEndpoint, response.ExpiresAt)
+		if err != nil {
+			return terminalRelay(err)
+		}
 		s.leaseMu.Lock()
 		if s.lease.token != token || s.lease.generation != generation {
 			s.leaseMu.Unlock()
@@ -1145,6 +1192,7 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 		s.nextLeaseGeneration++
 		s.lease.token = newToken
 		s.lease.expiresAt = response.ExpiresAt
+		s.lease.reverse = reverse
 		s.lease.renewing = false
 		s.lease.tokenUncertain = false
 		s.lease.generation = s.nextLeaseGeneration
@@ -1319,6 +1367,14 @@ func (s *relaySupervisor) currentTokenExpiryAndGeneration() (string, time.Time, 
 	return token, expiry, generation
 }
 
+func (s *relaySupervisor) currentReverseEndpoint() (reverseEndpoint, uint64, bool) {
+	s.leaseMu.RLock()
+	reverse, generation := s.lease.reverse, s.lease.generation
+	ok := s.lease.token != "" && reverse.Capability != ""
+	s.leaseMu.RUnlock()
+	return reverse, generation, ok
+}
+
 func (s *relaySupervisor) currentPublicURL() string {
 	s.leaseMu.RLock()
 	publicURL := s.lease.publicURL
@@ -1345,7 +1401,14 @@ func (s *relaySupervisor) endRenewal(generation uint64) {
 	s.leaseMu.Unlock()
 }
 
-func (s *relaySupervisor) reverseConnectRequestStale(token string, generation uint64) bool {
+func (s *relaySupervisor) reverseConnectRequestStale(capability string, generation uint64) bool {
+	s.leaseMu.RLock()
+	stale := s.lease.reverse.Capability != capability || s.lease.generation != generation || s.lease.renewing
+	s.leaseMu.RUnlock()
+	return stale
+}
+
+func (s *relaySupervisor) datagramTokenStale(token string, generation uint64) bool {
 	s.leaseMu.RLock()
 	stale := s.lease.token != token || s.lease.generation != generation || s.lease.renewing
 	s.leaseMu.RUnlock()

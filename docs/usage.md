@@ -107,7 +107,7 @@ Only one goroutine should consume `Updates`. Use `Relays` for sorted point-in-ti
 ### Relay state semantics
 
 - `connecting`: registration, renewal, or reverse-session setup is still in progress.
-- `ready`: the relay passed Protocol 8 and tenant-certificate checks, returned a valid `/v1/sign` signature for its certificate, and accepted at least one reverse HTTP/1.1 session.
+- `ready`: the relay passed Protocol 9 and tenant-certificate checks, returned a valid `/v1/sign` signature for its certificate, and accepted at least one reverse HTTP/1.1 session.
 - `udp_ready`: the relay also authenticated a QUIC datagram backhaul and returned a public UDP address.
 - `failed`: that relay reached a terminal protocol, certificate, authentication, or transport error.
 

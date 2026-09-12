@@ -187,7 +187,12 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 				Identity:    identityRef{Name: " ALICE ", Address: strings.ToLower(scalarOneAddress)},
 				ExpiresAt:   leaseExpiry,
 				AccessToken: "lease-token",
-				SNIPort:     8443,
+				ReverseEndpoint: reverseEndpoint{
+					URL:        relay.URL + pathConnect,
+					Capability: "cap-1",
+					ExpiresAt:  leaseExpiry,
+				},
+				SNIPort: 8443,
 			})
 		case "/v1/sign":
 			if got := r.Header.Get(accessTokenHeader); got != "lease-token" {
@@ -397,8 +402,8 @@ func TestReverseUpgradeRequiresStrict101HeadersAndPreservesBufferedMarker(t *tes
 					if !headerHasToken(r.Header, "Connection", "upgrade") || !strings.EqualFold(r.Header.Get("Upgrade"), "raw") {
 						t.Errorf("connect upgrade headers = %v", r.Header)
 					}
-					if got := r.Header.Get(accessTokenHeader); got != "lease-token" {
-						t.Errorf("connect access token = %q, want lease-token", got)
+					if got := r.Header.Get(reverseCapabilityHeader); got != "cap-1" {
+						t.Errorf("connect reverse capability = %q, want cap-1", got)
 					}
 					conn, readWriter, hijackErr := http.NewResponseController(w).Hijack()
 					if hijackErr != nil {
@@ -427,6 +432,11 @@ func TestReverseUpgradeRequiresStrict101HeadersAndPreservesBufferedMarker(t *tes
 			}
 			supervisor.leaseMu.Lock()
 			supervisor.lease.token = "lease-token"
+			supervisor.lease.reverse = reverseEndpoint{
+				URL:        relay.URL + pathConnect,
+				Capability: "cap-1",
+				ExpiresAt:  time.Now().Add(time.Hour),
+			}
 			supervisor.leaseMu.Unlock()
 
 			conn, err := supervisor.openReverseSession(context.Background())

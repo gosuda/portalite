@@ -87,6 +87,8 @@ type fakeRelay struct {
 	challengeMessage      string
 	challengeIdentity     identityRef
 	currentToken          string
+	currentCapability     string
+	capabilities          map[string]string
 	challengeUDPEnabled   bool
 	leaseNotFoundSent     bool
 	transientRenewSent    bool
@@ -168,17 +170,18 @@ func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRela
 	}
 	port := baseListener.Addr().(*net.TCPAddr).Port
 	relay := &fakeRelay{
-		name:      name,
-		url:       "https://localhost:" + strconv.Itoa(port),
-		port:      port,
-		leaf:      leaf,
-		key:       key,
-		listener:  baseListener,
-		serveDone: make(chan error, 1),
-		options:   options,
-		changed:   make(chan struct{}),
-		errors:    make(chan error, 32),
-		sessions:  make(map[int]*fakeRelaySession),
+		name:         name,
+		url:          "https://localhost:" + strconv.Itoa(port),
+		port:         port,
+		leaf:         leaf,
+		key:          key,
+		listener:     baseListener,
+		serveDone:    make(chan error, 1),
+		options:      options,
+		changed:      make(chan struct{}),
+		errors:       make(chan error, 32),
+		sessions:     make(map[int]*fakeRelaySession),
+		capabilities: make(map[string]string),
 	}
 	tlsConfig := &tls.Config{
 		MinVersion:   tls.VersionTLS12,
@@ -435,7 +438,10 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 	r.registerCount++
 	registration := r.registerCount
 	token := fmt.Sprintf("%s-token-%d", r.name, registration)
+	capability := fmt.Sprintf("%s-capability-%d", r.name, registration)
 	r.currentToken = token
+	r.currentCapability = capability
+	r.capabilities[capability] = token
 	r.connectLeaseLost = false
 	udpEnabled := r.challengeUDPEnabled
 	leaseDuration := r.options.initialLease
@@ -463,11 +469,17 @@ func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.R
 		_ = conn.Close()
 	}
 
+	leaseExpiresAt := time.Now().Add(leaseDuration)
 	result := registerResponse{
 		Identity:    identity,
-		ExpiresAt:   time.Now().Add(leaseDuration),
+		ExpiresAt:   leaseExpiresAt,
 		AccessToken: token,
-		SNIPort:     sniPort,
+		ReverseEndpoint: reverseEndpoint{
+			URL:        r.url + pathConnect,
+			Capability: capability,
+			ExpiresAt:  leaseExpiresAt,
+		},
+		SNIPort: sniPort,
 	}
 	if udpEnabled {
 		result.UDPEnabled = true
@@ -516,12 +528,21 @@ func (r *fakeRelay) handleRenew(response http.ResponseWriter, request *http.Requ
 		return
 	}
 	newToken := fmt.Sprintf("%s-renewed-%d", r.name, renewCount)
+	newCapability := fmt.Sprintf("%s-capability-renewed-%d", r.name, renewCount)
 	r.currentToken = newToken
+	r.currentCapability = newCapability
+	r.capabilities[newCapability] = newToken
 	r.signalLocked()
 	r.mu.Unlock()
+	leaseExpiresAt := time.Now().Add(r.options.renewedLease)
 	r.success(response, renewResponse{
 		AccessToken: newToken,
-		ExpiresAt:   time.Now().Add(r.options.renewedLease),
+		ExpiresAt:   leaseExpiresAt,
+		ReverseEndpoint: reverseEndpoint{
+			URL:        r.url + pathConnect,
+			Capability: newCapability,
+			ExpiresAt:  leaseExpiresAt,
+		},
 	})
 }
 
@@ -551,12 +572,13 @@ func (r *fakeRelay) handleConnect(response http.ResponseWriter, request *http.Re
 		r.badRequest(response, errors.New("invalid reverse upgrade request"))
 		return
 	}
-	token := request.Header.Get(accessTokenHeader)
+	capability := request.Header.Get(reverseCapabilityHeader)
 	r.mu.Lock()
+	token := r.capabilities[capability]
 	r.connectTokens = append(r.connectTokens, token)
 	terminal := r.terminalConnect
 	currentToken := r.currentToken
-	leaseLost := r.connectLeaseLost && token == currentToken
+	leaseLost := r.connectLeaseLost && token != "" && token == currentToken
 	if leaseLost {
 		r.connectLeaseLossCount++
 	}
@@ -567,7 +589,7 @@ func (r *fakeRelay) handleConnect(response http.ResponseWriter, request *http.Re
 		return
 	}
 	if leaseLost || token == "" || token != currentToken {
-		r.fail(response, http.StatusUnauthorized, "unauthorized", "bad access token")
+		r.fail(response, http.StatusUnauthorized, "unauthorized", "bad reverse capability")
 		return
 	}
 
