@@ -174,6 +174,8 @@ Expose TCP and UDP targets under the same relay lease:
 
 Flags must appear before the optional TCP target. Repeating `--relay` replaces the built-in relay set; canonical duplicates are removed while preserving input order. Without `--relay`, the CLI uses `portalite.DefaultRelays()`. At least one TCP target or `--udp-target` is required.
 
+The full flag set is `--relay`, `--identity`, `--name`, `--ephemeral`, and `--udp-target`. `--identity` defaults to `identity.json` and names the file the CLI reads or creates; `--ephemeral` replaces that file with an in-memory identity and cannot be combined with an explicit `--identity`. See [Ephemeral identity](#ephemeral-identity) for the `--name` reuse caveat.
+
 The command writes one line per ready relay to stdout:
 
 ```text
@@ -184,6 +186,16 @@ UDP relay.example:40000
 Terminal relay failures are written to stderr. One failed relay does not terminate the command while another relay remains live or retrying. `SIGINT` and `SIGTERM` cancel sessions, unregister leases, and exit successfully after cleanup.
 
 If the identity file does not exist, the CLI creates it with mode `0600` and creates missing parent directories with mode `0700`. An existing identity is never overwritten.
+
+### Ephemeral identity
+
+`--ephemeral` keeps the identity in memory and never writes it to disk, so the command works on read-only filesystems and leaves no private key behind:
+
+```sh
+./portalite expose --ephemeral 3000
+```
+
+Without `--name` the CLI generates a fresh random name, so the public URL changes on every run. `--name` may be combined with `--ephemeral` to pin the hostname; the relay binds that hostname to the identity, so a name whose lease is still live (an unclean shutdown, or a concurrent run) fails registration with a hostname conflict. `--ephemeral` and `--identity` are mutually exclusive.
 
 ## Target formats
 

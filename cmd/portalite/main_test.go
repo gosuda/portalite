@@ -153,6 +153,120 @@ func TestRunAcceptsUDPOnlyBeforeCancelledContext(t *testing.T) {
 	}
 }
 
+func TestRunEphemeralIdentityNeverWritesToDisk(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var generated string
+	generate := func(name string) (portalite.Identity, error) {
+		generated = name
+		return portalite.IdentityFromPrivateKey(name, "0000000000000000000000000000000000000000000000000000000000000001")
+	}
+	loadIdentity := func(_, _ string) (portalite.Identity, error) {
+		t.Fatal("ephemeral run must not load an identity from disk")
+		return portalite.Identity{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	exit := runWithIdentityModes(ctx, []string{"expose", "--ephemeral", "8080"}, &stdout, &stderr, loadIdentity, generate)
+	if exit != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %q", exit, stderr.String())
+	}
+	if want := "portalite-"; !strings.HasPrefix(generated, want) || len(generated) != len(want)+12 {
+		t.Fatalf("generated identity name = %q, want %s<12 hex>", generated, want)
+	}
+	if _, err := os.Stat("identity.json"); !os.IsNotExist(err) {
+		t.Fatalf("ephemeral run touched identity.json (stat err = %v)", err)
+	}
+}
+
+func TestRunEphemeralIdentityHonorsPinnedName(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	var generated string
+	generate := func(name string) (portalite.Identity, error) {
+		generated = name
+		return portalite.IdentityFromPrivateKey(name, "0000000000000000000000000000000000000000000000000000000000000001")
+	}
+	loadIdentity := func(_, _ string) (portalite.Identity, error) {
+		t.Fatal("ephemeral run must not load an identity from disk")
+		return portalite.Identity{}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	exit := runWithIdentityModes(ctx, []string{"expose", "--ephemeral", "--name", " Pinned-Name ", "8080"}, &stdout, &stderr, loadIdentity, generate)
+	if exit != 0 {
+		t.Fatalf("exit = %d, want 0; stderr = %q", exit, stderr.String())
+	}
+	if generated != "pinned-name" {
+		t.Fatalf("generated identity name = %q, want normalized %q", generated, "pinned-name")
+	}
+	if _, err := os.Stat("identity.json"); !os.IsNotExist(err) {
+		t.Fatalf("ephemeral run touched identity.json (stat err = %v)", err)
+	}
+}
+
+func TestRunRejectsIdentityFlagWithEphemeral(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	called := false
+	generate := func(name string) (portalite.Identity, error) {
+		called = true
+		return portalite.IdentityFromPrivateKey(name, "0000000000000000000000000000000000000000000000000000000000000001")
+	}
+	loadIdentity := func(_, _ string) (portalite.Identity, error) {
+		called = true
+		return portalite.Identity{}, nil
+	}
+
+	for _, args := range [][]string{
+		{"expose", "--ephemeral", "--identity", "custom.json", "8080"},
+		{"expose", "--identity=custom.json", "--ephemeral", "8080"},
+	} {
+		called = false
+		var stdout, stderr bytes.Buffer
+		exit := runWithIdentityModes(context.Background(), args, &stdout, &stderr, loadIdentity, generate)
+		if exit != 2 {
+			t.Fatalf("run(%q) exit = %d, want 2; stderr = %q", args, exit, stderr.String())
+		}
+		if called {
+			t.Fatalf("run(%q) reached identity resolution despite conflicting flags", args)
+		}
+		want := "portalite: --identity cannot be combined with --ephemeral\n" + usageLine
+		if got := stderr.String(); got != want {
+			t.Fatalf("run(%q) stderr = %q, want %q", args, got, want)
+		}
+	}
+}
+
+func TestRunEphemeralIdentityRejectsInvalidPinnedName(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	called := false
+	generate := func(name string) (portalite.Identity, error) {
+		called = true
+		return portalite.IdentityFromPrivateKey(name, "0000000000000000000000000000000000000000000000000000000000000001")
+	}
+	loadIdentity := func(_, _ string) (portalite.Identity, error) {
+		t.Fatal("ephemeral run must not load an identity from disk")
+		return portalite.Identity{}, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	exit := runWithIdentityModes(context.Background(),
+		[]string{"expose", "--ephemeral", "--name", "-bad-", "8080"},
+		&stdout, &stderr, loadIdentity, generate)
+	if exit != 2 {
+		t.Fatalf("exit = %d, want 2; stderr = %q", exit, stderr.String())
+	}
+	if called {
+		t.Fatal("invalid pinned name still reached identity generation")
+	}
+}
+
 func TestWriteUDPRelayStatus(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	writeRelayStatus(&stdout, &stderr, portalite.RelayStatus{

@@ -19,7 +19,7 @@ import (
 	"gosuda.org/portalite"
 )
 
-const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--udp-target TARGET] [TARGET]\n"
+const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--udp-target TARGET] [TARGET]\n"
 
 type relayFlags []string
 
@@ -57,14 +57,26 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	return runWithIdentityLoader(ctx, args, stdout, stderr, loadOrCreateIdentity)
+	return runWithIdentityModes(ctx, args, stdout, stderr, loadOrCreateIdentity, portalite.GenerateIdentity)
 }
 
+// runWithIdentityLoader keeps the file-backed identity seam used by tests that
+// exercise identity persistence.
 func runWithIdentityLoader(
 	ctx context.Context,
 	args []string,
 	stdout, stderr io.Writer,
 	loadIdentity identityLoader,
+) int {
+	return runWithIdentityModes(ctx, args, stdout, stderr, loadIdentity, portalite.GenerateIdentity)
+}
+
+func runWithIdentityModes(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+	loadIdentity identityLoader,
+	generateIdentity identityGenerator,
 ) int {
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
 		writeUsage(stdout)
@@ -83,9 +95,11 @@ func runWithIdentityLoader(
 	var identityPath string
 	var name string
 	var udpTarget string
+	var ephemeral bool
 	fs.Var(&relayValues, "relay", "relay HTTPS URL")
 	fs.StringVar(&identityPath, "identity", "identity.json", "identity file")
 	fs.StringVar(&name, "name", "", "identity name for a new identity")
+	fs.BoolVar(&ephemeral, "ephemeral", false, "keep the identity in memory and never write it to disk")
 	fs.StringVar(&udpTarget, "udp-target", "", "local UDP target")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -94,6 +108,12 @@ func runWithIdentityLoader(
 		}
 		return usageError(stderr, err.Error())
 	}
+	identityFlagSet := false
+	fs.Visit(func(visited *flag.Flag) {
+		if visited.Name == "identity" {
+			identityFlagSet = true
+		}
+	})
 	if fs.NArg() > 1 {
 		return usageError(stderr, "expected at most one TCP TARGET")
 	}
@@ -119,7 +139,15 @@ func runWithIdentityLoader(
 		return usageError(stderr, err.Error())
 	}
 
-	identity, err := loadIdentity(identityPath, name)
+	var identity portalite.Identity
+	if ephemeral {
+		if identityFlagSet {
+			return usageError(stderr, "--identity cannot be combined with --ephemeral")
+		}
+		identity, err = loadEphemeralIdentity(name, generateIdentity)
+	} else {
+		identity, err = loadIdentity(identityPath, name)
+	}
 	if err != nil {
 		var usageErr *identityUsageError
 		if errors.As(err, &usageErr) {
@@ -208,6 +236,33 @@ func loadOrCreateIdentity(path, requestedName string) (portalite.Identity, error
 	return loadOrCreateIdentityWith(path, requestedName, portalite.GenerateIdentity, os.OpenFile)
 }
 
+// loadEphemeralIdentity builds an identity that never touches the filesystem.
+// A pinned --name keeps the public hostname stable across runs, but the relay
+// binds that hostname to the identity, so reusing a name whose lease is still
+// live fails registration with a hostname conflict.
+func loadEphemeralIdentity(requestedName string, generate identityGenerator) (portalite.Identity, error) {
+	normalizedName, err := normalizeRequestedIdentityName(requestedName)
+	if err != nil {
+		return portalite.Identity{}, &identityUsageError{err: err}
+	}
+	identityName := normalizedName
+	if identityName == "" {
+		identityName, err = randomIdentityName()
+		if err != nil {
+			return portalite.Identity{}, err
+		}
+	}
+	return generate(identityName)
+}
+
+func randomIdentityName() (string, error) {
+	var random [6]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", fmt.Errorf("generate identity name: %w", err)
+	}
+	return "portalite-" + hex.EncodeToString(random[:]), nil
+}
+
 func loadOrCreateIdentityWith(
 	path, requestedName string,
 	generate identityGenerator,
@@ -235,11 +290,10 @@ func loadOrCreateIdentityWith(
 
 	identityName := normalizedRequestedName
 	if identityName == "" {
-		var random [6]byte
-		if _, err := rand.Read(random[:]); err != nil {
-			return portalite.Identity{}, fmt.Errorf("generate identity name: %w", err)
+		identityName, err = randomIdentityName()
+		if err != nil {
+			return portalite.Identity{}, err
 		}
-		identityName = "portalite-" + hex.EncodeToString(random[:])
 	}
 	identity, err := generate(identityName)
 	if err != nil {
