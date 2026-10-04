@@ -8,7 +8,7 @@ import (
 )
 
 // ProtocolVersion is the relay SDK protocol version implemented by Portalite.
-const ProtocolVersion = "9"
+const ProtocolVersion = "10"
 
 const (
 	pathDomain            = "/sdk/domain"
@@ -23,7 +23,12 @@ const (
 
 	markerKeepalive byte = 0x00
 	markerRaw       byte = 0x01 // Recognized only so the unsupported raw transport can be rejected.
-	markerTLS       byte = 0x02
+	markerTLS       byte = 0x02 // Followed by tlsBindingSize bytes of per-connection binding.
+
+	// tlsBindingSize is the per-connection value the relay mints for each
+	// reverse TLS activation frame. The tenant must present it on every
+	// transcript-signing request for that connection.
+	tlsBindingSize = 16
 
 	maxControlResponseBytes int64 = 1 << 20
 )

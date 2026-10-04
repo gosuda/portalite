@@ -4,11 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -24,6 +19,8 @@ import (
 	"time"
 
 	"github.com/gosuda/keyless_tls/keyless"
+	"github.com/gosuda/keyless_tls/keyless/t13server"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 
 	"github.com/quic-go/quic-go"
 )
@@ -31,8 +28,6 @@ import (
 const reverseSessionSlots = 2
 
 const maxReverseResponseHeadBytes int64 = 1 << 20
-
-var tenantSignerProbeDigest = sha256.Sum256([]byte("portalite tenant signer probe"))
 
 type relayTimings struct {
 	leaseTTL         time.Duration
@@ -95,6 +90,62 @@ func (t relayTimings) ttlSeconds() int {
 	return seconds
 }
 
+// tenantTLS is the protocol-10 tenant TLS terminator for one lease: a
+// keyless_tls t13server whose CertificateVerify signatures are produced by
+// the relay's transcript-bound /v1/sign endpoint.
+type tenantTLS struct {
+	server *t13server.Server
+	signer *leaseTranscriptSigner
+}
+
+func (t *tenantTLS) close() error {
+	if t == nil || t.signer == nil || t.signer.signer == nil {
+		return nil
+	}
+	return t.signer.signer.Close()
+}
+
+// leaseTranscriptSigner forwards transcript-signing requests to the relay and
+// records failures per reverse-session binding so a handshake failure caused
+// by the signer can be distinguished from an unrelated tenant TLS failure.
+type leaseTranscriptSigner struct {
+	signer *keyless.RemoteSigner
+
+	mu   sync.Mutex
+	errs map[string]error
+}
+
+func (s *leaseTranscriptSigner) SignTranscript(ctx context.Context, request *signrpc.TranscriptSignRequest) (*signrpc.TranscriptSignResponse, error) {
+	response, err := s.signer.SignTranscript(ctx, request)
+	// A cancelled caller context is a session or shutdown decision, not a
+	// signer failure, so only genuine signing errors are attributed.
+	if err != nil && ctx.Err() == nil {
+		s.mu.Lock()
+		if s.errs == nil {
+			s.errs = make(map[string]error)
+		}
+		binding := string(request.Binding)
+		if _, exists := s.errs[binding]; !exists {
+			s.errs[binding] = err
+		}
+		s.mu.Unlock()
+	}
+	return response, err
+}
+
+// takeError returns and clears the recorded signing failure for one binding.
+func (s *leaseTranscriptSigner) takeError(binding []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.errs == nil {
+		return nil
+	}
+	key := string(binding)
+	err := s.errs[key]
+	delete(s.errs, key)
+	return err
+}
+
 type relayLease struct {
 	token          string
 	expiresAt      time.Time
@@ -102,8 +153,7 @@ type relayLease struct {
 	udpAddr        string
 	sniPort        int
 	reverse        reverseEndpoint
-	tlsConfig      *tls.Config
-	signer         *keyless.RemoteSigner
+	tenant         *tenantTLS
 	generation     uint64
 	renewing       bool
 	tokenUncertain bool
@@ -113,6 +163,7 @@ type relaySupervisor struct {
 	relayURL       string
 	authority      string
 	hostname       string
+	relayPort      string
 	dialAddress    string
 	publicHostname string
 	identity       Identity
@@ -127,7 +178,6 @@ type relaySupervisor struct {
 	leaseMu             sync.RWMutex
 	lease               relayLease
 	nextLeaseGeneration uint64
-	signerWG            sync.WaitGroup
 
 	datagramMu   sync.RWMutex
 	datagramConn *quic.Conn
@@ -165,70 +215,6 @@ type tenantSignerError struct {
 
 func (e *tenantSignerError) Error() string { return fmt.Sprintf("tenant TLS signer: %v", e.err) }
 func (e *tenantSignerError) Unwrap() error { return e.err }
-
-type signerResult struct {
-	signature []byte
-	err       error
-}
-
-type recordingSigner struct {
-	ctx        context.Context
-	signer     crypto.Signer
-	inflight   *sync.WaitGroup
-	generation uint64
-	mu         sync.Mutex
-	err        error
-}
-
-func (s *recordingSigner) Public() crypto.PublicKey { return s.signer.Public() }
-
-func (s *recordingSigner) Sign(_ io.Reader, digest []byte, opts crypto.SignerOpts) ([]byte, error) {
-	digestCopy := append([]byte(nil), digest...)
-	optsCopy := copySignerOpts(opts)
-	result := make(chan signerResult, 1)
-	s.inflight.Add(1)
-	go func() {
-		defer s.inflight.Done()
-		signature, err := s.signer.Sign(nil, digestCopy, optsCopy)
-		s.record(err)
-		result <- signerResult{signature: signature, err: err}
-	}()
-
-	select {
-	case completed := <-result:
-		return completed.signature, completed.err
-	case <-s.ctx.Done():
-		return nil, s.ctx.Err()
-	}
-}
-
-func copySignerOpts(opts crypto.SignerOpts) crypto.SignerOpts {
-	if opts == nil {
-		return nil
-	}
-	if pss, ok := opts.(*rsa.PSSOptions); ok {
-		copy := *pss
-		return &copy
-	}
-	return opts.HashFunc()
-}
-
-func (s *recordingSigner) record(err error) {
-	if err == nil {
-		return
-	}
-	s.mu.Lock()
-	if s.err == nil {
-		s.err = err
-	}
-	s.mu.Unlock()
-}
-
-func (s *recordingSigner) signingError() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.err
-}
 
 type reverseResponseHeadReader struct {
 	reader    io.Reader
@@ -270,6 +256,7 @@ func newRelaySupervisor(relayURL string, identity Identity, timings relayTimings
 		relayURL:    relayURL,
 		authority:   parsed.Host,
 		hostname:    parsed.Hostname(),
+		relayPort:   parsed.Port(),
 		dialAddress: net.JoinHostPort(parsed.Hostname(), port),
 		identity:    identity,
 		timings:     timings.withDefaults(),
@@ -547,19 +534,18 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 		}
 	}
 
-	publicURL := "https://" + s.publicHostname
-	if response.SNIPort > 0 && response.SNIPort != 443 {
-		publicURL = "https://" + net.JoinHostPort(s.publicHostname, fmt.Sprint(response.SNIPort))
-	}
+	// Protocol 10 deprecates sni_port for URL derivation: the public URL
+	// follows the relay origin the caller configured, and sni_port is only
+	// meaningful for the UDP backhaul.
+	publicURL := s.derivedPublicURL()
 
-	signer, tlsConfig, err := s.buildTenantTLS(responseToken)
-	if err == nil {
-		err = verifyTenantSigner(signer)
-	}
+	s.leaseMu.Lock()
+	s.nextLeaseGeneration++
+	generation := s.nextLeaseGeneration
+	s.leaseMu.Unlock()
+
+	tenant, err := s.buildTenantTLS(responseToken)
 	if err != nil {
-		if signer != nil {
-			_ = signer.Close()
-		}
 		unregisterCtx, cancel := context.WithTimeout(context.Background(), s.timings.shutdownTimeout)
 		unregisterErr := s.unregisterToken(unregisterCtx, responseToken)
 		cancel()
@@ -570,7 +556,6 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 	}
 
 	s.leaseMu.Lock()
-	s.nextLeaseGeneration++
 	s.lease = relayLease{
 		token:      responseToken,
 		expiresAt:  response.ExpiresAt,
@@ -578,12 +563,20 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 		udpAddr:    udpAddr,
 		sniPort:    response.SNIPort,
 		reverse:    reverse,
-		tlsConfig:  tlsConfig,
-		signer:     signer,
-		generation: s.nextLeaseGeneration,
+		tenant:     tenant,
+		generation: generation,
 	}
 	s.leaseMu.Unlock()
 	return nil
+}
+
+// derivedPublicURL builds the public ingress URL for this relay's lease from
+// the configured relay origin, matching protocol 10 semantics.
+func (s *relaySupervisor) derivedPublicURL() string {
+	if s.relayPort != "" && s.relayPort != "443" {
+		return "https://" + net.JoinHostPort(s.publicHostname, s.relayPort)
+	}
+	return "https://" + s.publicHostname
 }
 
 // validateReverseEndpoint checks that a relay-issued reverse endpoint is
@@ -615,67 +608,46 @@ func (s *relaySupervisor) validateReverseEndpoint(endpoint reverseEndpoint, leas
 	return endpoint, nil
 }
 
-func (s *relaySupervisor) buildTenantTLS(initialToken string) (*keyless.RemoteSigner, *tls.Config, error) {
-	signer, err := s.newRemoteSigner(func() http.Header {
-		header := make(http.Header, 1)
-		token := s.currentToken()
-		if token == "" {
-			token = initialToken
-		}
-		if token != "" {
-			header.Set(accessTokenHeader, token)
-		}
-		return header
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
-	tlsConfig, err := keyless.NewServerTLSConfig(keyless.ServerTLSConfig{
-		CertPEM:    append([]byte(nil), s.certificateChain...),
-		Signer:     signer,
-		NextProtos: []string{"http/1.1"},
-		MinVersion: tls.VersionTLS12,
-	})
-	if err != nil {
-		_ = signer.Close()
-		return nil, nil, err
-	}
-	return signer, tlsConfig, nil
-}
-
-func verifyTenantSigner(signer crypto.Signer) error {
-	if signer == nil {
-		return errors.New("tenant TLS signer is nil")
-	}
-	signature, err := signer.Sign(rand.Reader, tenantSignerProbeDigest[:], crypto.SHA256)
-	if err != nil {
-		return fmt.Errorf("probe tenant TLS signer: %w", err)
-	}
-	switch publicKey := signer.Public().(type) {
-	case *rsa.PublicKey:
-		if err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, tenantSignerProbeDigest[:], signature); err != nil {
-			return fmt.Errorf("tenant TLS signer does not match relay certificate: %w", err)
-		}
-	case *ecdsa.PublicKey:
-		if !ecdsa.VerifyASN1(publicKey, tenantSignerProbeDigest[:], signature) {
-			return errors.New("tenant TLS signer does not match relay certificate")
-		}
-	default:
-		return fmt.Errorf("unsupported tenant TLS signer public key %T", signer.Public())
-	}
-	return nil
-}
-
-func (s *relaySupervisor) newRemoteSigner(headers func() http.Header) (*keyless.RemoteSigner, error) {
-	return keyless.NewRemoteSigner(keyless.RemoteSignerConfig{
+// buildTenantTLS creates the lease-scoped tenant TLS terminator. Protocol 10
+// signs every TLS 1.3 CertificateVerify through the relay's transcript-bound
+// /v1/sign endpoint, so no digest-signing probe is possible or needed: key
+// possession is proven on each handshake. The signer reads the current access
+// token per request, so one terminator serves every lease generation.
+func (s *relaySupervisor) buildTenantTLS(initialToken string) (*tenantTLS, error) {
+	remoteSigner, err := keyless.NewRemoteSigner(keyless.RemoteSignerConfig{
 		Endpoint:   s.relayURL,
 		ServerName: s.hostname,
 		KeyID:      "relay-cert",
 		RootCAPEM:  append([]byte(nil), s.certificateChain...),
 		Timeout:    s.timings.requestTimeout,
-		Headers:    headers,
-	}, s.certificateChain)
+		Headers: func() http.Header {
+			header := make(http.Header, 1)
+			token := s.currentToken()
+			if token == "" {
+				token = initialToken
+			}
+			if token != "" {
+				header.Set(accessTokenHeader, token)
+			}
+			return header
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	signer := &leaseTranscriptSigner{signer: remoteSigner}
+	server, err := t13server.NewServer(t13server.Config{
+		CertPEM:          append([]byte(nil), s.certificateChain...),
+		NextProtos:       []string{"http/1.1"},
+		KeyID:            "relay-cert",
+		TranscriptSigner: signer,
+	})
+	if err != nil {
+		_ = remoteSigner.Close()
+		return nil, err
+	}
+	return &tenantTLS{server: server, signer: signer}, nil
 }
 
 func (s *relaySupervisor) runLease(
@@ -1094,23 +1066,26 @@ func (s *relaySupervisor) runReverseSession(ctx context.Context, conn net.Conn, 
 		case markerRaw:
 			return false, false, terminalRelay(errors.New("relay requested unsupported raw stream marker 0x01"))
 		case markerTLS:
+			var binding [tlsBindingSize]byte
+			if _, err := io.ReadFull(conn, binding[:]); err != nil {
+				return false, false, fmt.Errorf("read reverse TLS binding: %w", err)
+			}
 			if err := conn.SetDeadline(time.Time{}); err != nil {
 				return false, true, fmt.Errorf("clear reverse marker deadline: %w", err)
 			}
-			handshakeCtx, cancel := context.WithTimeout(ctx, s.timings.handshakeTimeout)
-			tlsConfig, sessionSigner, err := s.tenantTLSForSession(handshakeCtx)
+			server, signer, generation, err := s.currentTenantTLS()
 			if err != nil {
-				cancel()
 				return false, true, err
 			}
-			tlsConn := tls.Server(conn, tlsConfig)
+			tlsConn := server.NewConn(conn, binding[:])
+			handshakeCtx, cancel := context.WithTimeout(ctx, s.timings.handshakeTimeout)
 			err = tlsConn.HandshakeContext(handshakeCtx)
 			cancel()
 			if err != nil {
-				if signerErr := sessionSigner.signingError(); signerErr != nil {
+				if signerErr := signer.takeError(binding[:]); signerErr != nil {
 					return false, true, &tenantSignerError{
 						err:        signerErr,
-						generation: sessionSigner.generation,
+						generation: generation,
 					}
 				}
 				return false, true, fmt.Errorf("tenant TLS handshake: %w", err)
@@ -1316,9 +1291,8 @@ func (s *relaySupervisor) shutdown() error {
 		}
 		cancel()
 	}
-	s.signerWG.Wait()
-	if signer := s.clearLease(); signer != nil {
-		if err := signer.Close(); err != nil {
+	if tenant := s.clearLease(); tenant != nil {
+		if err := tenant.close(); err != nil {
 			errs = append(errs, fmt.Errorf("close keyless signer: %w", err))
 		}
 	}
@@ -1328,18 +1302,17 @@ func (s *relaySupervisor) shutdown() error {
 
 func (s *relaySupervisor) discardLostLease() {
 	s.clearDatagramConn(nil, "lease lost")
-	s.signerWG.Wait()
-	if signer := s.clearLease(); signer != nil {
-		_ = signer.Close()
+	if tenant := s.clearLease(); tenant != nil {
+		_ = tenant.close()
 	}
 }
 
-func (s *relaySupervisor) clearLease() *keyless.RemoteSigner {
+func (s *relaySupervisor) clearLease() *tenantTLS {
 	s.leaseMu.Lock()
-	signer := s.lease.signer
+	tenant := s.lease.tenant
 	s.lease = relayLease{}
 	s.leaseMu.Unlock()
-	return signer
+	return tenant
 }
 
 func (s *relaySupervisor) resetControl() {
@@ -1422,33 +1395,19 @@ func (s *relaySupervisor) signerGenerationStale(generation uint64) bool {
 	return stale
 }
 
-func (s *relaySupervisor) tenantTLSForSession(ctx context.Context) (*tls.Config, *recordingSigner, error) {
+// currentTenantTLS returns the active lease's tenant TLS terminator, its
+// transcript signer, and the lease generation that is current right now. The
+// caller compares that generation later to decide whether a signing failure
+// belongs to the live lease or to a token that rotated mid-handshake.
+func (s *relaySupervisor) currentTenantTLS() (*t13server.Server, *leaseTranscriptSigner, uint64, error) {
 	s.leaseMu.RLock()
-	base := s.lease.tlsConfig
+	tenant := s.lease.tenant
 	generation := s.lease.generation
-	if base == nil || s.lease.token == "" {
-		s.leaseMu.RUnlock()
-		return nil, nil, errors.New("tenant TLS configuration is unavailable")
-	}
-	config := base.Clone()
-	config.Certificates = append([]tls.Certificate(nil), base.Certificates...)
 	s.leaseMu.RUnlock()
-
-	if len(config.Certificates) == 0 {
-		return nil, nil, errors.New("tenant TLS configuration has no certificate")
+	if tenant == nil || tenant.server == nil || tenant.signer == nil {
+		return nil, nil, 0, errors.New("tenant TLS configuration is unavailable")
 	}
-	signer, ok := config.Certificates[0].PrivateKey.(crypto.Signer)
-	if !ok || signer == nil {
-		return nil, nil, errors.New("tenant TLS certificate has no crypto signer")
-	}
-	sessionSigner := &recordingSigner{
-		ctx:        ctx,
-		signer:     signer,
-		inflight:   &s.signerWG,
-		generation: generation,
-	}
-	config.Certificates[0].PrivateKey = sessionSigner
-	return config, sessionSigner, nil
+	return tenant.server, tenant.signer, generation, nil
 }
 
 func classifyRelayError(err error, allowLeaseRefresh bool) error {

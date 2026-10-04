@@ -194,31 +194,9 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 				},
 				SNIPort: 8443,
 			})
-		case "/v1/sign":
-			if got := r.Header.Get(accessTokenHeader); got != "lease-token" {
-				t.Errorf("sign access token = %q, want lease-token", got)
-			}
-			var request struct {
-				KeyID     string `json:"key_id"`
-				Algorithm string `json:"algorithm"`
-				Digest    []byte `json:"digest"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Errorf("decode sign request: %v", err)
-				return
-			}
-			signature, err := ecdsa.SignASN1(rand.Reader, relay.Key, request.Digest)
-			if err != nil {
-				t.Errorf("sign probe digest: %v", err)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"key_id":    request.KeyID,
-				"algorithm": request.Algorithm,
-				"signature": signature,
-			})
 		default:
+			// Protocol 10 has no registration-time digest oracle: a valid
+			// lease must not issue any /v1/sign request before tenant traffic.
 			http.NotFound(w, r)
 		}
 	}))
@@ -237,11 +215,15 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	if got := supervisor.currentToken(); got != "lease-token" {
 		t.Fatalf("currentToken() = %q, want lease-token", got)
 	}
-	if got := supervisor.currentPublicURL(); got != "https://alice.localhost:8443" {
-		t.Fatalf("currentPublicURL() = %q, want https://alice.localhost:8443", got)
+	// The relay reports sni_port 8443, but protocol 10 derives the public URL
+	// from the configured relay origin instead.
+	relayPort := strings.TrimPrefix(relay.URL, "https://localhost:")
+	wantPublicURL := "https://alice.localhost:" + relayPort
+	if got := supervisor.currentPublicURL(); got != wantPublicURL {
+		t.Fatalf("currentPublicURL() = %q, want %q", got, wantPublicURL)
 	}
-	if signer := supervisor.clearLease(); signer != nil {
-		_ = signer.Close()
+	if tenant := supervisor.clearLease(); tenant != nil {
+		_ = tenant.close()
 	}
 }
 
@@ -469,10 +451,14 @@ func TestReverseSessionMarkerBoundaries(t *testing.T) {
 		name             string
 		markers          []byte
 		wantErrorContain string
+		wantTerminal     bool
 	}{
-		{"raw unsupported", []byte{markerRaw}, "unsupported raw stream marker 0x01"},
-		{"keepalive is skipped before raw", []byte{markerKeepalive, markerRaw}, "unsupported raw stream marker 0x01"},
-		{"unknown rejected", []byte{0x7f}, "unknown stream marker 0x7f"},
+		{"raw unsupported", []byte{markerRaw}, "unsupported raw stream marker 0x01", true},
+		{"keepalive is skipped before raw", []byte{markerKeepalive, markerRaw}, "unsupported raw stream marker 0x01", true},
+		{"unknown rejected", []byte{0x7f}, "unknown stream marker 0x7f", true},
+		// An incomplete activation frame is a closed or stalled reverse
+		// session, not a protocol violation, so it must stay retryable.
+		{"truncated TLS binding", []byte{markerTLS, 0x01, 0x02}, "read reverse TLS binding", false},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -503,8 +489,8 @@ func TestReverseSessionMarkerBoundaries(t *testing.T) {
 			if outcome.err == nil || !strings.Contains(outcome.err.Error(), test.wantErrorContain) {
 				t.Fatalf("runReverseSession error = %v, want containing %q", outcome.err, test.wantErrorContain)
 			}
-			if !isTerminalRelayFailure(outcome.err) {
-				t.Fatalf("marker error %v is not terminal", outcome.err)
+			if got := isTerminalRelayFailure(outcome.err); got != test.wantTerminal {
+				t.Fatalf("marker error %v terminal = %v, want %v", outcome.err, got, test.wantTerminal)
 			}
 		})
 	}

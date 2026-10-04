@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -26,6 +27,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	ksigner "github.com/gosuda/keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 
 	"gosuda.org/portalite"
 )
@@ -636,6 +640,7 @@ type cliTestRelay struct {
 	failure         error
 	failConnect     bool
 	connections     map[net.Conn]struct{}
+	bindings        map[string]struct{}
 	connectReady    chan net.Conn
 }
 
@@ -677,6 +682,7 @@ func newCLITestRelay(t *testing.T) *cliTestRelay {
 		key:          key,
 		certPEM:      certPEM,
 		connections:  make(map[net.Conn]struct{}),
+		bindings:     make(map[string]struct{}),
 		connectReady: make(chan net.Conn, 32),
 	}
 	server := httptest.NewUnstartedServer(http.HandlerFunc(relay.handle))
@@ -840,28 +846,42 @@ func (r *cliTestRelay) handleSign(w http.ResponseWriter, request *http.Request) 
 	if token := request.Header.Get("X-Portal-Access-Token"); token != "cli-test-token" {
 		r.recordFailure(fmt.Errorf("sign token = %q", token))
 	}
-	var input struct {
-		KeyID     string `json:"key_id"`
-		Algorithm string `json:"algorithm"`
-		Digest    []byte `json:"digest"`
-	}
+	var input signrpc.TranscriptSignRequest
 	if !r.decode(request, &input) {
 		return
 	}
-	if input.KeyID != "relay-cert" || input.Algorithm != "ECDSA_SHA256" || len(input.Digest) != 32 {
-		r.recordFailure(fmt.Errorf("unexpected sign request: key=%q algorithm=%q digest=%d bytes", input.KeyID, input.Algorithm, len(input.Digest)))
+	if input.KeyID != "relay-cert" || input.Algorithm != signrpc.AlgorithmECDSASHA256 ||
+		len(input.ClientHello) == 0 || len(input.ServerHello) == 0 ||
+		len(input.EncryptedExtensions) == 0 || len(input.Certificate) == 0 ||
+		input.TimestampUnix == 0 || input.Nonce == "" {
+		r.recordFailure(fmt.Errorf("unexpected sign request: %+v", input))
 	}
-	signature, err := ecdsa.SignASN1(rand.Reader, r.key, input.Digest)
+	r.mu.Lock()
+	_, bindingKnown := r.bindings[string(input.Binding)]
+	r.mu.Unlock()
+	if !bindingKnown {
+		r.recordFailure(fmt.Errorf("sign request presented unknown binding"))
+		http.Error(w, `{"error":"unknown binding"}`, http.StatusForbidden)
+		return
+	}
+	transcript := make([]byte, 0, len(input.ClientHello)+len(input.ServerHello)+len(input.EncryptedExtensions)+len(input.Certificate))
+	transcript = append(transcript, input.ClientHello...)
+	transcript = append(transcript, input.ServerHello...)
+	transcript = append(transcript, input.EncryptedExtensions...)
+	transcript = append(transcript, input.Certificate...)
+	transcriptHash := sha256.Sum256(transcript)
+	digest := sha256.Sum256(ksigner.FormatCertificateVerifyContent(transcriptHash[:]))
+	signature, err := ecdsa.SignASN1(rand.Reader, r.key, digest[:])
 	if err != nil {
-		r.recordFailure(fmt.Errorf("sign digest: %w", err))
+		r.recordFailure(fmt.Errorf("sign transcript: %w", err))
 		http.Error(w, "signing failed", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(map[string]any{
-		"key_id":    input.KeyID,
-		"algorithm": input.Algorithm,
-		"signature": signature,
+	if err := json.NewEncoder(w).Encode(signrpc.TranscriptSignResponse{
+		KeyID:     input.KeyID,
+		Algorithm: input.Algorithm,
+		Signature: signature,
 	}); err != nil {
 		r.recordFailure(fmt.Errorf("write sign response: %w", err))
 	}
@@ -957,14 +977,26 @@ func (r *cliTestRelay) TenantRequest(identityName, path string) (string, error) 
 	if err := connection.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return "", fmt.Errorf("set tenant deadline: %w", err)
 	}
-	if _, err := connection.Write([]byte{0x02}); err != nil {
-		return "", fmt.Errorf("write TLS marker: %w", err)
+	// Protocol 10 activation frame: markerTLS followed by the relay-minted
+	// per-connection binding the tenant must present when signing.
+	binding := make([]byte, 16)
+	if _, err := rand.Read(binding); err != nil {
+		_ = connection.Close()
+		return "", fmt.Errorf("mint tenant binding: %w", err)
+	}
+	r.mu.Lock()
+	r.bindings[string(binding)] = struct{}{}
+	r.mu.Unlock()
+	activation := append([]byte{0x02}, binding...)
+	if _, err := connection.Write(activation); err != nil {
+		return "", fmt.Errorf("write TLS activation frame: %w", err)
 	}
 	tenant := tls.Client(connection, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ServerName: identityName + ".localhost",
-		RootCAs:    roots,
-		NextProtos: []string{"http/1.1"},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: []tls.CurveID{tls.X25519},
+		ServerName:       identityName + ".localhost",
+		RootCAs:          roots,
+		NextProtos:       []string{"http/1.1"},
 	})
 	defer tenant.Close()
 	if err := tenant.Handshake(); err != nil {

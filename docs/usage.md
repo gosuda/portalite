@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Go 1.25 or newer
+- Go 1.27 or newer
 - A local TCP service for CLI proxying, or a Go server that accepts a `net.Listener`
 - Outbound HTTPS access to the selected relays
 
@@ -107,11 +107,11 @@ Only one goroutine should consume `Updates`. Use `Relays` for sorted point-in-ti
 ### Relay state semantics
 
 - `connecting`: registration, renewal, or reverse-session setup is still in progress.
-- `ready`: the relay passed Protocol 9 and tenant-certificate checks, returned a valid `/v1/sign` signature for its certificate, and accepted at least one reverse HTTP/1.1 session.
+- `ready`: the relay passed Protocol 10 and tenant-certificate checks and accepted at least one reverse HTTP/1.1 session. Tenant TLS is terminated locally through `keyless_tls`: each routed connection carries a relay-minted 16-byte binding, and the CertificateVerify signature for its handshake is produced remotely by the relay's transcript-bound `/v1/sign` endpoint. Key possession is therefore proven per handshake instead of by a registration-time probe.
 - `udp_ready`: the relay also authenticated a QUIC datagram backhaul and returned a public UDP address.
 - `failed`: that relay reached a terminal protocol, certificate, authentication, or transport error.
 
-`ready` validates the SDK-to-relay control, signing, and reverse-session paths. It does not actively send a request through the relay's public ingress. An external routing or firewall fault can therefore still make an individual public URL unreachable.
+`ready` validates the SDK-to-relay control path and the reverse-session path. Transcript-bound signing is exercised by the first tenant connection rather than at registration, because Protocol 10 removed the digest-signing oracle. `ready` does not actively send a request through the relay's public ingress, so an external routing or firewall fault can still make an individual public URL unreachable.
 
 Each relay owns its lease, token, signer, reverse sessions, retries, and shutdown. A terminal failure changes only that relay to `failed`; connections from other relays continue through the same listener. `Accept` returns `portalite.ErrNoRelays` only after every configured relay has failed. Calling `Close`, or canceling the parent context, returns `net.ErrClosed` to blocked accept calls and unregisters each live lease.
 
@@ -243,7 +243,15 @@ The proxy maintains one connected local UDP socket per relay/flow pair, expires 
 
 UDP availability is relay-dependent and can change at runtime. A relay that returns `udp_disabled`, exhausts its UDP port pool, or rejects the datagram transport fails independently; other UDP-capable relays continue. Use `WaitDatagramReady`, `Updates`, or `Relays` to observe current capability instead of inferring it from the default registry.
 
-Portalite still excludes raw TCP port allocation, multi-hop, and ECH controls. Receiving the raw stream marker remains a terminal protocol error for that relay.
+Portalite still excludes raw TCP port allocation, multi-hop, and alternate reverse-endpoint hosts. Receiving the raw stream marker remains a terminal protocol error for that relay; an incomplete TLS activation frame is treated as a stalled session and retried.
+
+## Protocol 10 compatibility
+
+- The SDK speaks relay SDK protocol `10` and refuses a relay whose `/sdk/domain` reports any other version.
+- Tenant TLS terminates through `keyless_tls`'s `t13server`. The relay's reverse-session activation frame is `0x02` followed by 16 bytes of per-connection binding; the SDK presents that binding on every `/v1/sign` request, whose payload is the TLS 1.3 handshake transcript.
+- Public URLs are derived from the configured relay origin. `sni_port` is no longer used for URL derivation (it remains required for the UDP backhaul), so re-registration never changes an advertised URL.
+- A relay that refuses transcript signing fails that relay terminally; other relays continue.
+- `/sdk/reverse` endpoint refresh is not implemented: Portalite requires the reverse endpoint to match the configured relay origin, so an alternate-host endpoint is rejected at registration instead of refreshed.
 
 ## API summary
 

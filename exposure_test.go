@@ -2,11 +2,11 @@ package portalite
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	stdecdsa "crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -27,6 +27,8 @@ import (
 	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
+	ksigner "github.com/gosuda/keyless_tls/relay/signer"
+	"github.com/gosuda/keyless_tls/relay/signrpc"
 
 	"github.com/quic-go/quic-go"
 	"golang.org/x/crypto/sha3"
@@ -47,7 +49,7 @@ type fakeRelayOptions struct {
 	signRequestStarted   chan<- string
 	signRequestRelease   <-chan struct{}
 	signRequestFinished  chan<- struct{}
-	invalidSigner        bool
+	rejectTranscriptSign bool
 	udpEnabled           bool
 }
 
@@ -55,6 +57,7 @@ type fakeRelaySession struct {
 	id      int
 	token   string
 	conn    net.Conn
+	binding []byte
 	claimed bool
 }
 
@@ -98,6 +101,7 @@ type fakeRelay struct {
 	signRequestHeld       bool
 	nextSessionID         int
 	sessions              map[int]*fakeRelaySession
+	bindings              map[string]struct{}
 	connectTokens         []string
 	signTokens            []string
 	quicListener          *quic.Listener
@@ -108,19 +112,8 @@ type fakeRelay struct {
 	closed                bool
 }
 
-type fakeSignRequest struct {
-	KeyID         string `json:"key_id"`
-	Algorithm     string `json:"algorithm"`
-	Digest        []byte `json:"digest"`
-	TimestampUnix int64  `json:"timestamp_unix"`
-	Nonce         string `json:"nonce"`
-}
-
-type fakeSignResponse struct {
-	KeyID     string `json:"key_id"`
-	Algorithm string `json:"algorithm"`
-	Signature []byte `json:"signature"`
-}
+// fakeSignRequest mirrors the protocol-10 transcript-bound /v1/sign contract.
+type fakeSignRequest = signrpc.TranscriptSignRequest
 
 func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRelay {
 	t.Helper()
@@ -181,6 +174,7 @@ func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRela
 		changed:      make(chan struct{}),
 		errors:       make(chan error, 32),
 		sessions:     make(map[int]*fakeRelaySession),
+		bindings:     make(map[string]struct{}),
 		capabilities: make(map[string]string),
 	}
 	tlsConfig := &tls.Config{
@@ -622,6 +616,9 @@ func (r *fakeRelay) handleConnect(response http.ResponseWriter, request *http.Re
 	r.mu.Unlock()
 }
 
+// handleSign serves the protocol-10 transcript-bound signing contract: the
+// relay validates the per-connection binding it minted, then signs the TLS
+// handshake transcript with the certificate key.
 func (r *fakeRelay) handleSign(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		r.badRequest(response, fmt.Errorf("sign method = %s", request.Method))
@@ -632,20 +629,32 @@ func (r *fakeRelay) handleSign(response http.ResponseWriter, request *http.Reque
 		r.badRequest(response, fmt.Errorf("decode sign: %w", err))
 		return
 	}
-	if body.KeyID != "relay-cert" || len(body.Digest) == 0 || body.TimestampUnix == 0 || body.Nonce == "" || !strings.HasPrefix(body.Algorithm, "ECDSA_") {
+	if body.KeyID != "relay-cert" || body.Algorithm != signrpc.AlgorithmECDSASHA256 ||
+		len(body.Binding) == 0 || len(body.ClientHello) == 0 || len(body.ServerHello) == 0 ||
+		len(body.EncryptedExtensions) == 0 || len(body.Certificate) == 0 ||
+		body.TimestampUnix == 0 || body.Nonce == "" {
 		r.badRequest(response, fmt.Errorf("invalid sign request: %+v", body))
 		return
 	}
 	token := request.Header.Get(accessTokenHeader)
 	r.mu.Lock()
 	r.signTokens = append(r.signTokens, token)
-	isProbe := bytes.Equal(body.Digest, tenantSignerProbeDigest[:])
-	hold := !isProbe && !r.signRequestHeld && r.options.signRequestRelease != nil
+	_, bindingKnown := r.bindings[string(body.Binding)]
+	hold := !r.signRequestHeld && r.options.signRequestRelease != nil
 	if hold {
 		r.signRequestHeld = true
 	}
+	reject := r.options.rejectTranscriptSign
 	r.signalLocked()
 	r.mu.Unlock()
+	if !bindingKnown {
+		http.Error(response, `{"error":"unknown binding"}`, http.StatusForbidden)
+		return
+	}
+	if reject {
+		http.Error(response, `{"error":"transcript signing denied"}`, http.StatusForbidden)
+		return
+	}
 	if hold {
 		if r.options.signRequestStarted != nil {
 			r.options.signRequestStarted <- token
@@ -666,20 +675,35 @@ func (r *fakeRelay) handleSign(response http.ResponseWriter, request *http.Reque
 		http.Error(response, `{"error":"bad access token"}`, http.StatusUnauthorized)
 		return
 	}
-	signature, err := stdecdsa.SignASN1(rand.Reader, r.key, body.Digest)
+	signature, err := signTranscript(r.key, &body)
 	if err != nil {
-		r.badRequest(response, fmt.Errorf("sign digest: %w", err))
+		r.badRequest(response, err)
 		return
 	}
-	if r.options.invalidSigner && len(signature) != 0 {
-		signature[len(signature)-1] ^= 0xff
-	}
 	response.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(response).Encode(fakeSignResponse{
+	_ = json.NewEncoder(response).Encode(signrpc.TranscriptSignResponse{
 		KeyID:     body.KeyID,
 		Algorithm: body.Algorithm,
 		Signature: signature,
 	})
+}
+
+// signTranscript produces the CertificateVerify signature for a transcript
+// request exactly as the relay-side keyless signer does.
+func signTranscript(key *stdecdsa.PrivateKey, request *signrpc.TranscriptSignRequest) ([]byte, error) {
+	transcriptHash := sha256.Sum256(concatTranscript(request))
+	content := ksigner.FormatCertificateVerifyContent(transcriptHash[:])
+	digest := sha256.Sum256(content)
+	return stdecdsa.SignASN1(rand.Reader, key, digest[:])
+}
+
+func concatTranscript(request *signrpc.TranscriptSignRequest) []byte {
+	transcript := make([]byte, 0, len(request.ClientHello)+len(request.ServerHello)+len(request.EncryptedExtensions)+len(request.Certificate))
+	transcript = append(transcript, request.ClientHello...)
+	transcript = append(transcript, request.ServerHello...)
+	transcript = append(transcript, request.EncryptedExtensions...)
+	transcript = append(transcript, request.Certificate...)
+	return transcript
 }
 
 func (r *fakeRelay) success(response http.ResponseWriter, data any) {
@@ -837,16 +861,24 @@ func (r *fakeRelay) startRequestThroughSession(t *testing.T, token, serverName, 
 }
 
 func (r *fakeRelay) requestOnSession(selected *fakeRelaySession, serverName, path string) (string, error) {
-	if _, err := selected.conn.Write([]byte{markerTLS}); err != nil {
-		return "", fmt.Errorf("write TLS marker: %w", err)
+	binding, err := r.mintBinding(selected)
+	if err != nil {
+		return "", err
+	}
+	activation := make([]byte, 0, 1+tlsBindingSize)
+	activation = append(activation, markerTLS)
+	activation = append(activation, binding...)
+	if _, err := selected.conn.Write(activation); err != nil {
+		return "", fmt.Errorf("write TLS activation frame: %w", err)
 	}
 	roots := x509.NewCertPool()
 	roots.AddCert(r.leaf)
 	tenant := tls.Client(selected.conn, &tls.Config{
-		MinVersion: tls.VersionTLS12,
-		ServerName: serverName,
-		RootCAs:    roots,
-		NextProtos: []string{"http/1.1"},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: []tls.CurveID{tls.X25519},
+		ServerName:       serverName,
+		RootCAs:          roots,
+		NextProtos:       []string{"http/1.1"},
 	})
 	if err := tenant.SetDeadline(time.Now().Add(fakeRelayWait)); err != nil {
 		return "", fmt.Errorf("set tenant deadline: %w", err)
@@ -880,6 +912,21 @@ func (r *fakeRelay) requestOnSession(selected *fakeRelaySession, serverName, pat
 		return "", fmt.Errorf("tenant response status = %d, body = %q", response.StatusCode, body)
 	}
 	return string(body), nil
+}
+
+// mintBinding mints and records the per-connection binding the relay delivers
+// in the reverse-session TLS activation frame.
+func (r *fakeRelay) mintBinding(session *fakeRelaySession) ([]byte, error) {
+	binding := make([]byte, tlsBindingSize)
+	if _, err := rand.Read(binding); err != nil {
+		return nil, fmt.Errorf("mint binding: %w", err)
+	}
+	r.mu.Lock()
+	session.binding = binding
+	r.bindings[string(binding)] = struct{}{}
+	r.signalLocked()
+	r.mu.Unlock()
+	return binding, nil
 }
 
 func (r *fakeRelay) closeOneIdleAndRejectReconnect(t *testing.T) {
@@ -926,6 +973,27 @@ func (r *fakeRelay) closeOneIdleAndLoseConnectLease(t *testing.T) {
 	r.signalLocked()
 	r.mu.Unlock()
 	_ = selected.conn.Close()
+}
+
+// closeIdleSessions closes every currently idle reverse session, forcing the
+// supervisor to open fresh sessions under the current lease capability.
+func (r *fakeRelay) closeIdleSessions(t *testing.T) int {
+	t.Helper()
+	r.mu.Lock()
+	sessions := make([]net.Conn, 0, len(r.sessions))
+	for id, session := range r.sessions {
+		if session.claimed {
+			continue
+		}
+		sessions = append(sessions, session.conn)
+		delete(r.sessions, id)
+	}
+	r.signalLocked()
+	r.mu.Unlock()
+	for _, conn := range sessions {
+		_ = conn.Close()
+	}
+	return len(sessions)
 }
 
 func (r *fakeRelay) closeOneIdle(t *testing.T) {
@@ -1524,7 +1592,10 @@ func TestExposureStaleSignerRequestAcrossRenewalRecovers(t *testing.T) {
 	relay.assertNoErrors(t)
 }
 
-func TestExposureCloseWaitsForBoundedSignerAndCleansUp(t *testing.T) {
+// Shutdown must not wait on a relay that withholds a transcript-signature
+// response: cancelling the exposure aborts the in-flight sign request and
+// unregisters the lease.
+func TestExposureCloseAbortsStalledTranscriptSignerAndCleansUp(t *testing.T) {
 	signStarted := make(chan string, 1)
 	signFinished := make(chan struct{}, 1)
 	signRelease := make(chan struct{})
@@ -1539,8 +1610,8 @@ func TestExposureCloseWaitsForBoundedSignerAndCleansUp(t *testing.T) {
 	defer relay.close()
 	defer release()
 	timings := testRelayTimings()
-	timings.requestTimeout = 3 * time.Second
-	timings.handshakeTimeout = 3 * time.Second
+	timings.requestTimeout = 30 * time.Second
+	timings.handshakeTimeout = 30 * time.Second
 	exposure, err := exposeWithTimings(context.Background(), ExposeConfig{
 		Relays:   []string{relay.url},
 		Identity: newTestIdentity(t),
@@ -1567,31 +1638,19 @@ func TestExposureCloseWaitsForBoundedSignerAndCleansUp(t *testing.T) {
 	go func() { closeDone <- exposure.Close() }()
 	select {
 	case err := <-closeDone:
-		t.Fatalf("Exposure.Close returned before tracked signer completed: %v", err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	select {
-	case <-signFinished:
-		t.Fatal("sign handler finished before its deliberate hold was released")
-	default:
-	}
-	relay.waitFor(t, "unregister during stalled signer shutdown", func() bool {
-		return len(relay.unregisterTokens) == 1 && relay.unregisterTokens[0] == token
-	})
-
-	release()
-	select {
-	case <-signFinished:
-	case <-time.After(fakeRelayWait):
-		t.Fatal("tracked sign handler did not finish after release")
-	}
-	select {
-	case err := <-closeDone:
 		if err != nil {
 			t.Fatalf("Exposure.Close: %v", err)
 		}
 	case <-time.After(fakeRelayWait):
-		t.Fatal("Exposure.Close did not finish after tracked signer completed")
+		t.Fatal("Exposure.Close blocked on a stalled transcript signer")
+	}
+	relay.waitFor(t, "unregister during stalled signer shutdown", func() bool {
+		return len(relay.unregisterTokens) == 1 && relay.unregisterTokens[0] == token
+	})
+	select {
+	case <-signFinished:
+	case <-time.After(fakeRelayWait):
+		t.Fatal("relay sign handler did not observe the aborted request")
 	}
 
 	select {
@@ -1607,12 +1666,15 @@ func TestExposureCloseWaitsForBoundedSignerAndCleansUp(t *testing.T) {
 	relay.assertNoErrors(t)
 }
 
-func TestExposureReregistrationRefreshesStoredPublicURL(t *testing.T) {
+// Protocol 10 derives the public URL from the configured relay origin, so a
+// re-registration that reports a different sni_port must keep advertising the
+// same URL, and a terminal failure must carry that URL.
+func TestExposureReregistrationKeepsRelayDerivedPublicURL(t *testing.T) {
 	const (
 		initialSNIPort   = 1443
 		recoveredSNIPort = 2443
 	)
-	relay := newFakeRelay(t, "public-url-refresh", fakeRelayOptions{
+	relay := newFakeRelay(t, "public-url-stable", fakeRelayOptions{
 		initialLease:         150 * time.Millisecond,
 		renewedLease:         150 * time.Millisecond,
 		recoveredLease:       5 * time.Minute,
@@ -1637,10 +1699,10 @@ func TestExposureReregistrationRefreshesStoredPublicURL(t *testing.T) {
 		}
 	}()
 
-	initialURL := "https://tenant.localhost:" + strconv.Itoa(initialSNIPort)
+	wantURL := "https://tenant.localhost:" + strconv.Itoa(relay.port)
 	ready := waitForReady(t, exposure, 1)
-	if got := ready[relay.url].PublicURL; got != initialURL {
-		t.Fatalf("initial ready PublicURL = %q, want %q", got, initialURL)
+	if got := ready[relay.url].PublicURL; got != wantURL {
+		t.Fatalf("initial ready PublicURL = %q, want relay-derived %q", got, wantURL)
 	}
 
 	relay.waitFor(t, "full registration with changed SNI port", func() bool {
@@ -1649,25 +1711,14 @@ func TestExposureReregistrationRefreshesStoredPublicURL(t *testing.T) {
 	recoveredToken := relay.name + "-token-2"
 	relay.waitForIdleToken(t, recoveredToken, reverseSessionSlots)
 
-	recoveredURL := "https://tenant.localhost:" + strconv.Itoa(recoveredSNIPort)
-	statusTimer := time.NewTimer(fakeRelayWait)
-	statusTicker := time.NewTicker(time.Millisecond)
-	defer statusTimer.Stop()
-	defer statusTicker.Stop()
-	for {
-		statuses := exposure.Relays()
-		if len(statuses) != 1 {
-			t.Fatalf("Relays length = %d, want 1", len(statuses))
-		}
-		if statuses[0].PublicURL == recoveredURL {
-			break
-		}
-		select {
-		case <-statusTicker.C:
-		case <-statusTimer.C:
-			t.Fatalf("Relays PublicURL = %q, want refreshed %q", statuses[0].PublicURL, recoveredURL)
-		}
+	statuses := exposure.Relays()
+	if len(statuses) != 1 {
+		t.Fatalf("Relays length = %d, want 1", len(statuses))
 	}
+	if statuses[0].PublicURL != wantURL {
+		t.Fatalf("PublicURL after re-registration = %q, want unchanged %q", statuses[0].PublicURL, wantURL)
+	}
+	recoveredURL := wantURL
 
 	relay.closeOneIdleAndRejectReconnect(t)
 	var failed RelayStatus
@@ -1697,11 +1748,11 @@ func TestExposureReregistrationRefreshesStoredPublicURL(t *testing.T) {
 		t.Fatalf("additional ready updates = %d, want 0", additionalReady)
 	}
 	if failed.PublicURL != recoveredURL {
-		t.Fatalf("failed PublicURL = %q, want latest %q", failed.PublicURL, recoveredURL)
+		t.Fatalf("failed PublicURL = %q, want %q", failed.PublicURL, recoveredURL)
 	}
-	statuses := exposure.Relays()
-	if len(statuses) != 1 || statuses[0].State != RelayFailed || statuses[0].PublicURL != recoveredURL {
-		t.Fatalf("final Relays = %+v, want failed status with PublicURL %q", statuses, recoveredURL)
+	finalStatuses := exposure.Relays()
+	if len(finalStatuses) != 1 || finalStatuses[0].State != RelayFailed || finalStatuses[0].PublicURL != recoveredURL {
+		t.Fatalf("final Relays = %+v, want failed status with PublicURL %q", finalStatuses, recoveredURL)
 	}
 
 	if err := exposure.Close(); err != nil {
@@ -1722,10 +1773,12 @@ func exposureTestContainsString(values []string, wanted string) bool {
 	return false
 }
 
-func TestExposureRejectsMismatchedTenantSigner(t *testing.T) {
-	relay := newFakeRelay(t, "invalid-signer", fakeRelayOptions{invalidSigner: true})
+// A relay that refuses transcript signing cannot terminate tenant TLS, and
+// the refusal is a terminal relay failure rather than an endless retry.
+func TestExposureFailsTerminallyWhenTranscriptSigningIsRefused(t *testing.T) {
+	relay := newFakeRelay(t, "sign-refused", fakeRelayOptions{rejectTranscriptSign: true})
 	defer relay.close()
-	ctx, cancel := context.WithTimeout(context.Background(), fakeRelayWait)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	exposure, err := exposeWithTimings(ctx, ExposeConfig{
 		Relays:   []string{relay.url},
@@ -1736,19 +1789,95 @@ func TestExposureRejectsMismatchedTenantSigner(t *testing.T) {
 	}
 	defer exposure.Close()
 
+	_ = waitForReady(t, exposure, 1)
+	token := relay.currentAccessToken()
+	relay.waitForIdleToken(t, token, 1)
+	request := relay.startRequestThroughSession(t, token, "tenant.localhost", "/refused")
+	select {
+	case result := <-request:
+		if result.err == nil {
+			t.Fatalf("request unexpectedly succeeded with body %q", result.body)
+		}
+	case <-time.After(fakeRelayWait):
+		t.Fatal("tenant request did not fail after transcript signing was refused")
+	}
+
+	failed := waitForFailed(t, exposure, relay.url)
+	if failed.Err == nil || !strings.Contains(failed.Err.Error(), "transcript signing denied") {
+		t.Fatalf("relay failure = %v, want transcript signing denial", failed.Err)
+	}
 	if _, err := exposure.WaitReady(ctx); !errors.Is(err, ErrNoRelays) {
 		t.Fatalf("WaitReady error = %v, want ErrNoRelays", err)
 	}
-	statuses := exposure.Relays()
-	if len(statuses) != 1 || statuses[0].State != RelayFailed {
-		t.Fatalf("relay statuses = %+v, want one failed relay", statuses)
+
+	if err := exposure.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
-	if statuses[0].Err == nil || !strings.Contains(statuses[0].Err.Error(), "does not match relay certificate") {
-		t.Fatalf("relay failure = %v, want signer mismatch", statuses[0].Err)
-	}
-	relay.waitFor(t, "invalid signer lease unregister", func() bool {
+	relay.waitFor(t, "refused-signer lease unregister", func() bool {
 		return len(relay.unregisterTokens) == 1
 	})
+	relay.assertNoErrors(t)
+}
+
+// A relay that refuses transcript signing must stay terminal across renewals.
+// Signing failures are only excused when the lease token rotated underneath
+// the handshake, so the stale-generation window must not become permanent.
+func TestExposureTranscriptSigningRefusalStaysTerminalAfterRenewal(t *testing.T) {
+	relay := newFakeRelay(t, "sign-refused-renew", fakeRelayOptions{
+		initialLease:         time.Second,
+		renewedLease:         5 * time.Minute,
+		rejectTranscriptSign: true,
+	})
+	defer relay.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timings := testRelayTimings()
+	timings.renewBefore = 900 * time.Millisecond
+	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+		Relays:   []string{relay.url},
+		Identity: newTestIdentity(t),
+	}, timings)
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	defer exposure.Close()
+
+	_ = waitForReady(t, exposure, 1)
+	relay.waitFor(t, "access token renewal before the tenant request", func() bool {
+		return relay.renewCount >= 1 && relay.currentToken == relay.name+"-renewed-1"
+	})
+
+	// Existing reverse sessions keep their pre-renewal capability until they
+	// are replaced, so force fresh sessions before the tenant request.
+	relay.waitForIdleToken(t, relay.name+"-token-1", 1)
+	if closed := relay.closeIdleSessions(t); closed == 0 {
+		t.Fatal("no idle pre-renewal reverse sessions to replace")
+	}
+
+	token := relay.currentAccessToken()
+	relay.waitForIdleToken(t, token, reverseSessionSlots)
+	request := relay.startRequestThroughSession(t, token, "tenant.localhost", "/refused-after-renewal")
+	select {
+	case result := <-request:
+		if result.err == nil {
+			t.Fatalf("request unexpectedly succeeded with body %q", result.body)
+		}
+	case <-time.After(fakeRelayWait):
+		t.Fatal("tenant request did not fail after transcript signing was refused")
+	}
+
+	failed := waitForFailed(t, exposure, relay.url)
+	if failed.Err == nil || !strings.Contains(failed.Err.Error(), "transcript signing denied") {
+		t.Fatalf("relay failure after renewal = %v, want transcript signing denial", failed.Err)
+	}
+
+	if err := exposure.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	relay.waitFor(t, "refused-signer lease unregister", func() bool {
+		return len(relay.unregisterTokens) >= 1 && relay.unregisterTokens[0] == token
+	})
+	relay.assertNoErrors(t)
 }
 
 func TestExposureWaitReadyDoesNotConsumeUpdates(t *testing.T) {
