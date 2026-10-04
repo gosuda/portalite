@@ -84,8 +84,8 @@ Limit the demo to explicit relays or choose an identity name:
 
 ```sh
 go run ./cmd/http-demo \
-  --relay https://rly.best \
   --relay https://gosunuts.xyz \
+  --relay https://s-h.day \
   --name my-http-demo
 ```
 
@@ -199,15 +199,16 @@ A bare port binds either proxy target to `127.0.0.1`. URL schemes, paths, bare h
 
 ## Default relays
 
-`portalite.DefaultRelays()` returns a defensive copy of the built-in registry:
+`portalite.DefaultRelays()` returns a defensive copy of the built-in registry, which mirrors the canonical relay registry published by `gosuda/portal-tunnel`:
 
-1. `https://rly.best`
+1. `https://gosunuts.xyz`
 2. `https://portal.thumbgo.kr`
 3. `https://portal.rabbitson87.dev`
-4. `https://portal.dawnfullstack.com`
-5. `https://portal.damn.it.com`
-6. `https://s-h.day`
-7. `https://gosunuts.xyz`
+4. `https://s-h.day`
+5. `https://portal.dawnfullstack.com`
+6. `https://kakashit.org`
+7. `https://portal.damn.it.com`
+8. `https://portal.dps0340.win`
 
 Relay availability is operational state, not a static guarantee. Consume `Updates`, call `WaitReady`, or inspect `Relays` instead of assuming every configured relay is reachable.
 

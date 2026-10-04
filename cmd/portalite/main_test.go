@@ -176,13 +176,14 @@ func TestDefaultAndExplicitRelaySelection(t *testing.T) {
 		t.Fatalf("select default relays: %v", err)
 	}
 	wantDefaults := []string{
-		"https://rly.best",
+		"https://gosunuts.xyz",
 		"https://portal.thumbgo.kr",
 		"https://portal.rabbitson87.dev",
-		"https://portal.dawnfullstack.com",
-		"https://portal.damn.it.com",
 		"https://s-h.day",
-		"https://gosunuts.xyz",
+		"https://portal.dawnfullstack.com",
+		"https://kakashit.org",
+		"https://portal.damn.it.com",
+		"https://portal.dps0340.win",
 	}
 	if len(defaults) != len(wantDefaults) {
 		t.Fatalf("default relay count = %d, want %d", len(defaults), len(wantDefaults))

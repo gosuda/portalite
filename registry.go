@@ -1,13 +1,17 @@
 package portalite
 
+// defaultRelays mirrors the canonical relay registry published by
+// gosuda/portal-tunnel (registry.json) for the current protocol generation.
+// Relay availability is operational state, not a static guarantee.
 var defaultRelays = [...]string{
-	"https://rly.best",
+	"https://gosunuts.xyz",
 	"https://portal.thumbgo.kr",
 	"https://portal.rabbitson87.dev",
-	"https://portal.dawnfullstack.com",
-	"https://portal.damn.it.com",
 	"https://s-h.day",
-	"https://gosunuts.xyz",
+	"https://portal.dawnfullstack.com",
+	"https://kakashit.org",
+	"https://portal.damn.it.com",
+	"https://portal.dps0340.win",
 }
 
 // DefaultRelays returns the canonical built-in relay URLs in registry order.
