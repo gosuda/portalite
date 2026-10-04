@@ -50,6 +50,11 @@ type fakeRelayOptions struct {
 	signRequestRelease   <-chan struct{}
 	signRequestFinished  chan<- struct{}
 	rejectTranscriptSign bool
+	// rateLimitedRegisters throttles this many /sdk/register calls with
+	// HTTP 429 before admitting one, mirroring the relay's weighted pre-auth
+	// admission budget.
+	rateLimitedRegisters int
+	retryAfterSeconds    int
 	udpEnabled           bool
 }
 
@@ -78,38 +83,39 @@ type fakeRelay struct {
 
 	options fakeRelayOptions
 
-	mu                    sync.Mutex
-	changed               chan struct{}
-	errors                chan error
-	tlsHandshakes         int
-	domainCount           int
-	challengeCount        int
-	registerCount         int
-	renewCount            int
-	challengeID           string
-	challengeMessage      string
-	challengeIdentity     identityRef
-	currentToken          string
-	currentCapability     string
-	capabilities          map[string]string
-	challengeUDPEnabled   bool
-	leaseNotFoundSent     bool
-	transientRenewSent    bool
-	connectLeaseLost      bool
-	connectLeaseLossCount int
-	terminalConnect       bool
-	signRequestHeld       bool
-	nextSessionID         int
-	sessions              map[int]*fakeRelaySession
-	bindings              map[string]struct{}
-	connectTokens         []string
-	signTokens            []string
-	quicListener          *quic.Listener
-	quicDone              chan error
-	quicConn              *quic.Conn
-	quicTokens            []string
-	unregisterTokens      []string
-	closed                bool
+	mu                       sync.Mutex
+	changed                  chan struct{}
+	errors                   chan error
+	tlsHandshakes            int
+	domainCount              int
+	challengeCount           int
+	registerCount            int
+	renewCount               int
+	challengeID              string
+	challengeMessage         string
+	challengeIdentity        identityRef
+	currentToken             string
+	currentCapability        string
+	capabilities             map[string]string
+	challengeUDPEnabled      bool
+	rateLimitedRegistersSent int
+	leaseNotFoundSent        bool
+	transientRenewSent       bool
+	connectLeaseLost         bool
+	connectLeaseLossCount    int
+	terminalConnect          bool
+	signRequestHeld          bool
+	nextSessionID            int
+	sessions                 map[int]*fakeRelaySession
+	bindings                 map[string]struct{}
+	connectTokens            []string
+	signTokens               []string
+	quicListener             *quic.Listener
+	quicDone                 chan error
+	quicConn                 *quic.Conn
+	quicTokens               []string
+	unregisterTokens         []string
+	closed                   bool
 }
 
 // fakeSignRequest mirrors the protocol-10 transcript-bound /v1/sign contract.
@@ -403,9 +409,36 @@ func (r *fakeRelay) handleChallenge(response http.ResponseWriter, request *http.
 	})
 }
 
+// throttleRegister rejects the configured number of register calls with a
+// rate_limited response, mirroring the relay's weighted pre-auth admission
+// budget. It deliberately does not consume the signed challenge, so a client
+// that reuses its challenge can still succeed once the budget clears.
+func (r *fakeRelay) throttleRegister(response http.ResponseWriter) bool {
+	if r.options.rateLimitedRegisters <= 0 {
+		return false
+	}
+	r.mu.Lock()
+	if r.rateLimitedRegistersSent >= r.options.rateLimitedRegisters {
+		r.mu.Unlock()
+		return false
+	}
+	r.rateLimitedRegistersSent++
+	r.signalLocked()
+	r.mu.Unlock()
+
+	if r.options.retryAfterSeconds > 0 {
+		response.Header().Set("Retry-After", strconv.Itoa(r.options.retryAfterSeconds))
+	}
+	r.fail(response, http.StatusTooManyRequests, "rate_limited", "pre-auth request budget exhausted")
+	return true
+}
+
 func (r *fakeRelay) handleRegister(response http.ResponseWriter, request *http.Request) {
 	if request.Method != http.MethodPost {
 		r.badRequest(response, fmt.Errorf("register method = %s", request.Method))
+		return
+	}
+	if r.throttleRegister(response) {
 		return
 	}
 	var body registerRequest
@@ -1876,6 +1909,76 @@ func TestExposureTranscriptSigningRefusalStaysTerminalAfterRenewal(t *testing.T)
 	}
 	relay.waitFor(t, "refused-signer lease unregister", func() bool {
 		return len(relay.unregisterTokens) >= 1 && relay.unregisterTokens[0] == token
+	})
+	relay.assertNoErrors(t)
+}
+
+// A throttled relay is a temporary condition, not a terminal one: the
+// supervisor must back off and recover instead of marking the relay failed.
+func TestExposureRateLimitedRegistrationRetriesAndRecovers(t *testing.T) {
+	relay := newFakeRelay(t, "rate-limited", fakeRelayOptions{rateLimitedRegisters: 2})
+	defer relay.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+		Relays:   []string{relay.url},
+		Identity: newTestIdentity(t),
+	}, testRelayTimings())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	defer exposure.Close()
+
+	// waitForReady fails the test if the relay reports RelayFailed first.
+	ready := waitForReady(t, exposure, 1)
+	if ready[relay.url].State != RelayReady {
+		t.Fatalf("relay state = %q, want ready", ready[relay.url].State)
+	}
+	relay.waitFor(t, "two throttled register attempts then an admitted one", func() bool {
+		return relay.rateLimitedRegistersSent == 2 && relay.registerCount == 1
+	})
+
+	// A throttled relay must not be charged for a second challenge.
+	relay.mu.Lock()
+	challenges := relay.challengeCount
+	relay.mu.Unlock()
+	if challenges != 1 {
+		t.Fatalf("challenge count = %d, want 1: the signed challenge must be reused across throttled retries", challenges)
+	}
+	statuses := exposure.Relays()
+	if len(statuses) != 1 || statuses[0].State != RelayReady || statuses[0].Err != nil {
+		t.Fatalf("relay statuses = %+v, want one ready relay without a failure", statuses)
+	}
+	relay.assertNoErrors(t)
+}
+
+// The supervisor must wait at least as long as the relay asked before retrying.
+func TestExposureRateLimitRetryHonorsRetryAfter(t *testing.T) {
+	relay := newFakeRelay(t, "retry-after", fakeRelayOptions{
+		rateLimitedRegisters: 1,
+		retryAfterSeconds:    1,
+	})
+	defer relay.close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+		Relays:   []string{relay.url},
+		Identity: newTestIdentity(t),
+	}, testRelayTimings())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	defer exposure.Close()
+
+	// The base retry wait is 10ms, so honoring Retry-After: 1 is observable.
+	start := time.Now()
+	_ = waitForReady(t, exposure, 1)
+	elapsed := time.Since(start)
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("recovered in %v, want at least the advertised 1s Retry-After", elapsed)
+	}
+	relay.waitFor(t, "one throttled register then an admitted one", func() bool {
+		return relay.rateLimitedRegistersSent == 1 && relay.registerCount == 1
 	})
 	relay.assertNoErrors(t)
 }

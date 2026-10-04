@@ -34,10 +34,13 @@ const (
 )
 
 // APIError is an error returned by a relay control-plane endpoint.
+// RetryAfter carries the relay-advertised backoff for throttled responses; it
+// is zero when the relay sent no usable Retry-After header.
 type APIError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,47 @@ import (
 const reverseSessionSlots = 2
 
 const maxReverseResponseHeadBytes int64 = 1 << 20
+
+// maxRelayRetryDelay bounds a relay-advertised Retry-After. A relay is
+// entitled to throttle, but one relay must not park its supervisor for an
+// unbounded time; past this bound the supervisor retries on its own schedule.
+const maxRelayRetryDelay = 5 * time.Minute
+
+// parseRetryAfter reads the relay's Retry-After header, accepting both the
+// delta-seconds and the HTTP-date forms. It returns zero when absent or
+// unusable.
+func parseRetryAfter(response *http.Response) time.Duration {
+	if response == nil {
+		return 0
+	}
+	raw := strings.TrimSpace(response.Header.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseUint(raw, 10, 31); err == nil {
+		return time.Duration(seconds) * time.Second
+	}
+	if at, err := http.ParseTime(raw); err == nil {
+		if delay := time.Until(at); delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+// relayRetryDelay returns the backoff to wait after err: the configured base
+// delay, raised to the relay's advertised Retry-After when that is larger and
+// bounded by maxRelayRetryDelay.
+func relayRetryDelay(base time.Duration, err error) time.Duration {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.RetryAfter <= base {
+		return base
+	}
+	if apiErr.RetryAfter > maxRelayRetryDelay {
+		return maxRelayRetryDelay
+	}
+	return apiErr.RetryAfter
+}
 
 type relayTimings struct {
 	leaseTTL         time.Duration
@@ -289,31 +331,20 @@ func (s *relaySupervisor) run(
 			if isTerminalRelayFailure(err) {
 				return unwrapTerminalRelayError(err), nil
 			}
-			if !waitForRelayRetry(ctx, s.timings.retryWait) {
+			if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
 				return ctx.Err(), nil
 			}
 			continue
 		}
 
-		registered := false
-		for !registered {
-			if err := ctx.Err(); err != nil {
-				return err, nil
-			}
-			err := s.registerLease(ctx)
-			if err == nil {
-				registered = true
-				break
-			}
+		if err := s.registerLeaseWithRetry(ctx); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err(), nil
 			}
 			if isTerminalRelayFailure(err) {
 				return unwrapTerminalRelayError(err), nil
 			}
-			if !waitForRelayRetry(ctx, s.timings.retryWait) {
-				return ctx.Err(), nil
-			}
+			return err, nil
 		}
 
 		err := s.runLease(ctx, ready, datagramReady, offer, offerDatagram)
@@ -450,7 +481,58 @@ func isLocalRelayHostname(hostname string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func (s *relaySupervisor) registerLease(ctx context.Context) error {
+// registerAttempt is one signed registration challenge. It is owned by the
+// retry loop that created it, so a signed challenge can never outlive the
+// identity or relay generation it was signed for.
+type registerAttempt struct {
+	challengeID string
+	siweMessage string
+	signature   string
+	expiresAt   time.Time
+}
+
+func (a *registerAttempt) valid(now time.Time) bool {
+	return a != nil && a.challengeID != "" && now.Before(a.expiresAt)
+}
+
+// registerLeaseWithRetry registers the lease, retrying transient failures.
+// The signed challenge stays in this loop's scope: a throttled relay is never
+// charged for a second challenge, and a challenge signed for one identity can
+// never be reused after an identity or relay generation change.
+func (s *relaySupervisor) registerLeaseWithRetry(ctx context.Context) error {
+	var attempt *registerAttempt
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !attempt.valid(time.Now()) {
+			fresh, err := s.requestRegisterChallenge(ctx)
+			if err != nil {
+				if isTerminalRelayFailure(err) {
+					return err
+				}
+				if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
+					return ctx.Err()
+				}
+				continue
+			}
+			attempt = fresh
+		}
+		err := s.submitRegistration(ctx, attempt)
+		if err == nil {
+			return nil
+		}
+		if isTerminalRelayFailure(err) {
+			return err
+		}
+		if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
+			return ctx.Err()
+		}
+	}
+}
+
+// requestRegisterChallenge obtains and signs a fresh registration challenge.
+func (s *relaySupervisor) requestRegisterChallenge(ctx context.Context) (*registerAttempt, error) {
 	requestIdentity := identityRef{Name: s.identity.Name(), Address: s.identity.Address()}
 	var challenge challengeResponse
 	if err := s.doAPI(ctx, http.MethodPost, pathRegisterChallenge, challengeRequest{
@@ -458,28 +540,38 @@ func (s *relaySupervisor) registerLease(ctx context.Context) error {
 		TTL:        s.timings.ttlSeconds(),
 		UDPEnabled: s.udpEnabled,
 	}, &challenge); err != nil {
-		return classifyRelayError(err, false)
+		return nil, classifyRelayError(err, false)
 	}
 	if strings.TrimSpace(challenge.ChallengeID) == "" {
-		return terminalRelay(errors.New("register challenge has an empty challenge_id"))
+		return nil, terminalRelay(errors.New("register challenge has an empty challenge_id"))
 	}
 	if challenge.SIWEMessage == "" {
-		return terminalRelay(errors.New("register challenge has an empty siwe_message"))
+		return nil, terminalRelay(errors.New("register challenge has an empty siwe_message"))
 	}
 	if !challenge.ExpiresAt.After(time.Now()) {
-		return terminalRelay(errors.New("register challenge is expired"))
+		return nil, terminalRelay(errors.New("register challenge is expired"))
 	}
 
 	signature, err := s.identity.signEthereumPersonalMessage(challenge.SIWEMessage)
 	if err != nil {
-		return terminalRelay(fmt.Errorf("sign register challenge: %w", err))
+		return nil, terminalRelay(fmt.Errorf("sign register challenge: %w", err))
 	}
+	return &registerAttempt{
+		challengeID: challenge.ChallengeID,
+		siweMessage: challenge.SIWEMessage,
+		signature:   signature,
+		expiresAt:   challenge.ExpiresAt,
+	}, nil
+}
 
+// submitRegistration exchanges one signed challenge for a lease and installs it.
+func (s *relaySupervisor) submitRegistration(ctx context.Context, attempt *registerAttempt) error {
+	requestIdentity := identityRef{Name: s.identity.Name(), Address: s.identity.Address()}
 	var response registerResponse
 	if err := s.doAPI(ctx, http.MethodPost, pathRegister, registerRequest{
-		ChallengeID:   challenge.ChallengeID,
-		SIWEMessage:   challenge.SIWEMessage,
-		SIWESignature: signature,
+		ChallengeID:   attempt.challengeID,
+		SIWEMessage:   attempt.siweMessage,
+		SIWESignature: attempt.signature,
 	}, &response); err != nil {
 		return classifyRelayError(err, false)
 	}
@@ -767,7 +859,7 @@ func (s *relaySupervisor) runDatagramLoop(
 					return terminalRelay(err)
 				}
 			}
-			if !waitForRelayRetry(ctx, s.timings.retryWait) {
+			if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
 				return ctx.Err()
 			}
 			continue
@@ -883,7 +975,7 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 			var upgradeErr *reverseUpgradeError
 			if errors.As(err, &upgradeErr) && isLostLeaseError(err) &&
 				s.reverseConnectRequestStale(upgradeErr.capability, upgradeErr.generation) {
-				if !waitForRelayRetry(ctx, s.timings.retryWait) {
+				if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
 					return ctx.Err()
 				}
 				continue
@@ -892,7 +984,7 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 			if errors.Is(err, errLeaseRefresh) || isTerminalRelayFailure(err) {
 				return err
 			}
-			if !waitForRelayRetry(ctx, s.timings.retryWait) {
+			if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, err)) {
 				return ctx.Err()
 			}
 			continue
@@ -928,7 +1020,7 @@ func (s *relaySupervisor) runReverseSlot(ctx context.Context, ready func(), offe
 		if errors.Is(sessionErr, errLeaseRefresh) || isTerminalRelayFailure(sessionErr) {
 			return sessionErr
 		}
-		if !waitForRelayRetry(ctx, s.timings.retryWait) {
+		if !waitForRelayRetry(ctx, relayRetryDelay(s.timings.retryWait, sessionErr)) {
 			return ctx.Err()
 		}
 	}
@@ -1135,7 +1227,7 @@ func (s *relaySupervisor) runRenewLoop(ctx context.Context) error {
 			if !time.Now().Before(expiresAt) {
 				return errLeaseRefresh
 			}
-			delay := s.timings.retryWait
+			delay := relayRetryDelay(s.timings.retryWait, err)
 			if remaining := time.Until(expiresAt); remaining < delay {
 				delay = remaining
 			}
@@ -1212,13 +1304,13 @@ func (s *relaySupervisor) doAPI(ctx context.Context, method, path string, body, 
 			// completed malformed success response.
 			return err
 		}
-		return &APIError{StatusCode: response.StatusCode}
+		return &APIError{StatusCode: response.StatusCode, RetryAfter: parseRetryAfter(response)}
 	}
 
 	var envelope apiEnvelope
 	decodeErr := json.Unmarshal(payload, &envelope)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		apiErr := &APIError{StatusCode: response.StatusCode}
+		apiErr := &APIError{StatusCode: response.StatusCode, RetryAfter: parseRetryAfter(response)}
 		if decodeErr == nil && !envelope.OK && envelope.Error != nil {
 			apiErr.Code = envelope.Error.Code
 			apiErr.Message = envelope.Error.Message
@@ -1229,7 +1321,7 @@ func (s *relaySupervisor) doAPI(ctx context.Context, method, path string, body, 
 		return &malformedRelayResponseError{err: fmt.Errorf("decode successful relay response: %w", decodeErr)}
 	}
 	if !envelope.OK {
-		apiErr := &APIError{StatusCode: response.StatusCode}
+		apiErr := &APIError{StatusCode: response.StatusCode, RetryAfter: parseRetryAfter(response)}
 		if envelope.Error != nil {
 			apiErr.Code = envelope.Error.Code
 			apiErr.Message = envelope.Error.Message
@@ -1261,7 +1353,7 @@ func readBoundedControlBody(reader io.Reader) ([]byte, error) {
 func decodeHTTPAPIError(response *http.Response) error {
 	defer response.Body.Close()
 	payload, err := readBoundedControlBody(response.Body)
-	apiErr := &APIError{StatusCode: response.StatusCode}
+	apiErr := &APIError{StatusCode: response.StatusCode, RetryAfter: parseRetryAfter(response)}
 	if err != nil {
 		return apiErr
 	}
@@ -1410,6 +1502,34 @@ func (s *relaySupervisor) currentTenantTLS() (*t13server.Server, *leaseTranscrip
 	return tenant.server, tenant.signer, generation, nil
 }
 
+// terminalAPIErrorCodes are the relay responses that permanently reject this
+// lease or configuration. The relay SDK contract lists exactly these as
+// terminal; every other relay API error is retried, including throttles and
+// the transient capacity responses that also arrive as HTTP 503.
+var terminalAPIErrorCodes = map[string]struct{}{
+	"feature_unavailable": {},
+	"hostname_conflict":   {},
+	"http11_only":         {},
+	"tcp_port_disabled":   {},
+	"transport_mismatch":  {},
+	"udp_disabled":        {},
+}
+
+func isTerminalAPIErrorCode(code string) bool {
+	_, terminal := terminalAPIErrorCodes[strings.ToLower(strings.TrimSpace(code))]
+	return terminal
+}
+
+// isRateLimitedAPIError identifies a throttled response, which arrives either
+// as HTTP 429 or as a rate_limited code.
+func isRateLimitedAPIError(err *APIError) bool {
+	if err == nil {
+		return false
+	}
+	return err.StatusCode == http.StatusTooManyRequests ||
+		strings.EqualFold(strings.TrimSpace(err.Code), "rate_limited")
+}
+
 func classifyRelayError(err error, allowLeaseRefresh bool) error {
 	if err == nil || isTerminalRelayFailure(err) || errors.Is(err, errLeaseRefresh) {
 		return err
@@ -1426,11 +1546,13 @@ func classifyRelayError(err error, allowLeaseRefresh bool) error {
 	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		code := strings.ToLower(strings.TrimSpace(apiErr.Code))
-		if apiErr.StatusCode == http.StatusHTTPVersionNotSupported || code == "http11_only" {
+		// The code decides, not the status range: a terminal rejection is
+		// terminal at any status, and a throttle or a transient 503 is
+		// retryable even though both look like ordinary failures.
+		if isTerminalAPIErrorCode(apiErr.Code) {
 			return terminalRelay(err)
 		}
-		if apiErr.StatusCode >= 500 && apiErr.StatusCode != http.StatusHTTPVersionNotSupported {
+		if isRateLimitedAPIError(apiErr) || apiErr.StatusCode >= 500 {
 			return err
 		}
 		return terminalRelay(err)

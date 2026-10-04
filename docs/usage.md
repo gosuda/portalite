@@ -113,6 +113,15 @@ Only one goroutine should consume `Updates`. Use `Relays` for sorted point-in-ti
 
 `ready` validates the SDK-to-relay control path and the reverse-session path. Transcript-bound signing is exercised by the first tenant connection rather than at registration, because Protocol 10 removed the digest-signing oracle. `ready` does not actively send a request through the relay's public ingress, so an external routing or firewall fault can still make an individual public URL unreachable.
 
+### Relay retry contract
+
+A relay API failure is classified by its error code, not by its HTTP status:
+
+- Terminal for that relay: `hostname_conflict`, `feature_unavailable`, `transport_mismatch`, `udp_disabled`, `tcp_port_disabled`, and any control response that is not HTTP/1.1. The relay is marked `failed` and its lease is released.
+- Retried: `rate_limited` (HTTP 429), the transient capacity responses that share HTTP 503 (`udp_port_exhausted`, `udp_capacity_exceeded`, `tcp_port_exhausted`, `tcp_port_capacity_exceeded`), lost leases (`lease_not_found`, `unauthorized`), and transport errors.
+
+When a relay throttles, the supervisor waits for the relay's `Retry-After` when present, capped at five minutes, instead of the default retry interval, and it reuses the registration challenge it already signed rather than asking for a new one. A throttled relay therefore recovers on its own while every other relay keeps serving.
+
 Each relay owns its lease, token, signer, reverse sessions, retries, and shutdown. A terminal failure changes only that relay to `failed`; connections from other relays continue through the same listener. `Accept` returns `portalite.ErrNoRelays` only after every configured relay has failed. Calling `Close`, or canceling the parent context, returns `net.ErrClosed` to blocked accept calls and unregisters each live lease.
 
 ## Identity persistence

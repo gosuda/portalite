@@ -209,8 +209,8 @@ func TestRegisterLeaseExactChallengeAndSIWEWireContract(t *testing.T) {
 	if err := supervisor.initializeControl(context.Background()); err != nil {
 		t.Fatalf("initializeControl: %v", err)
 	}
-	if err := supervisor.registerLease(context.Background()); err != nil {
-		t.Fatalf("registerLease: %v", err)
+	if err := supervisor.registerLeaseWithRetry(context.Background()); err != nil {
+		t.Fatalf("registerLeaseWithRetry: %v", err)
 	}
 	if got := supervisor.currentToken(); got != "lease-token" {
 		t.Fatalf("currentToken() = %q, want lease-token", got)
@@ -493,6 +493,101 @@ func TestReverseSessionMarkerBoundaries(t *testing.T) {
 				t.Fatalf("marker error %v terminal = %v, want %v", outcome.err, got, test.wantTerminal)
 			}
 		})
+	}
+}
+
+// The relay SDK contract splits relay API failures into terminal rejections
+// and retryable conditions. HTTP status alone cannot express that split, so
+// this pins the code-level classification in both directions.
+func TestRelayErrorClassificationFollowsSDKContract(t *testing.T) {
+	terminal := []*APIError{
+		{StatusCode: http.StatusConflict, Code: "hostname_conflict"},
+		{StatusCode: http.StatusConflict, Code: "transport_mismatch"},
+		{StatusCode: http.StatusForbidden, Code: "udp_disabled"},
+		{StatusCode: http.StatusForbidden, Code: "tcp_port_disabled"},
+		{StatusCode: http.StatusHTTPVersionNotSupported, Code: "http11_only"},
+		// feature_unavailable shares HTTP 503 with transient capacity errors
+		// but permanently rejects this lease's requested configuration.
+		{StatusCode: http.StatusServiceUnavailable, Code: "feature_unavailable"},
+	}
+	for _, apiErr := range terminal {
+		if got := classifyRelayError(apiErr, false); !isTerminalRelayFailure(got) {
+			t.Errorf("classifyRelayError(%q/%d) = %v, want terminal", apiErr.Code, apiErr.StatusCode, got)
+		}
+	}
+
+	retryable := []*APIError{
+		{StatusCode: http.StatusTooManyRequests, Code: "rate_limited"},
+		// A gateway may throttle without Portal's JSON envelope.
+		{StatusCode: http.StatusTooManyRequests},
+		{StatusCode: http.StatusServiceUnavailable, Code: "udp_port_exhausted"},
+		{StatusCode: http.StatusServiceUnavailable, Code: "udp_capacity_exceeded"},
+		{StatusCode: http.StatusServiceUnavailable, Code: "tcp_port_exhausted"},
+		{StatusCode: http.StatusServiceUnavailable, Code: "tcp_port_capacity_exceeded"},
+		{StatusCode: http.StatusServiceUnavailable},
+	}
+	for _, apiErr := range retryable {
+		if got := classifyRelayError(apiErr, false); isTerminalRelayFailure(got) {
+			t.Errorf("classifyRelayError(%q/%d) = %v, want retryable", apiErr.Code, apiErr.StatusCode, got)
+		}
+	}
+
+	// A lost lease refreshes the lease instead of failing the relay.
+	lost := &APIError{StatusCode: http.StatusNotFound, Code: "lease_not_found"}
+	if got := classifyRelayError(lost, true); !errors.Is(got, errLeaseRefresh) {
+		t.Errorf("classifyRelayError(lease_not_found) = %v, want errLeaseRefresh", got)
+	}
+}
+
+func TestRetryAfterParsingAndRetryDelayBound(t *testing.T) {
+	response := func(value string) *http.Response {
+		header := make(http.Header)
+		if value != "" {
+			header.Set("Retry-After", value)
+		}
+		return &http.Response{Header: header}
+	}
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "absent", value: "", want: 0},
+		{name: "delta seconds", value: "120", want: 120 * time.Second},
+		{name: "zero seconds", value: "0", want: 0},
+		{name: "unparsable", value: "soon", want: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parseRetryAfter(response(test.value)); got != test.want {
+				t.Fatalf("parseRetryAfter(%q) = %v, want %v", test.value, got, test.want)
+			}
+		})
+	}
+	if got := parseRetryAfter(nil); got != 0 {
+		t.Fatalf("parseRetryAfter(nil) = %v, want 0", got)
+	}
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(response(future)); got <= 0 {
+		t.Fatalf("parseRetryAfter(HTTP-date) = %v, want a positive delay", got)
+	}
+	past := time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(response(past)); got != 0 {
+		t.Fatalf("parseRetryAfter(past HTTP-date) = %v, want 0", got)
+	}
+
+	const base = 3 * time.Second
+	if got := relayRetryDelay(base, &APIError{RetryAfter: 10 * time.Second}); got != 10*time.Second {
+		t.Fatalf("relayRetryDelay honored = %v, want 10s", got)
+	}
+	if got := relayRetryDelay(base, &APIError{RetryAfter: time.Second}); got != base {
+		t.Fatalf("relayRetryDelay below base = %v, want %v", got, base)
+	}
+	if got := relayRetryDelay(base, &APIError{RetryAfter: time.Hour}); got != maxRelayRetryDelay {
+		t.Fatalf("relayRetryDelay capped = %v, want %v", got, maxRelayRetryDelay)
+	}
+	if got := relayRetryDelay(base, errors.New("transport")); got != base {
+		t.Fatalf("relayRetryDelay without an APIError = %v, want %v", got, base)
 	}
 }
 
