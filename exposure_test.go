@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -26,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	ksigner "github.com/gosuda/keyless_tls/relay/signer"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
@@ -55,6 +57,12 @@ type fakeRelayOptions struct {
 	// admission budget.
 	rateLimitedRegisters int
 	retryAfterSeconds    int
+	// advertiseRelays are extra relays this relay publishes through
+	// /discovery, each signed by its own generated key.
+	advertiseRelays []string
+	// discoveryUnsupported makes /discovery report a revision this SDK does
+	// not accept, so the relay advertises nothing usable.
+	discoveryUnsupported bool
 	udpEnabled           bool
 }
 
@@ -72,14 +80,18 @@ type fakeRelayRequestResult struct {
 }
 
 type fakeRelay struct {
-	name      string
-	url       string
-	port      int
-	leaf      *x509.Certificate
-	key       *stdecdsa.PrivateKey
-	listener  net.Listener
-	server    *http.Server
-	serveDone chan error
+	name          string
+	url           string
+	port          int
+	leaf          *x509.Certificate
+	key           *stdecdsa.PrivateKey
+	descriptorKey *secp256k1.PrivateKey
+	// discoveryRelays is precomputed because the HTTP handler has no
+	// testing.TB to fail through.
+	discoveryRelays []relayDescriptor
+	listener        net.Listener
+	server          *http.Server
+	serveDone       chan error
 
 	options fakeRelayOptions
 
@@ -88,6 +100,7 @@ type fakeRelay struct {
 	errors                   chan error
 	tlsHandshakes            int
 	domainCount              int
+	discoveryCount           int
 	challengeCount           int
 	registerCount            int
 	renewCount               int
@@ -137,6 +150,10 @@ func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRela
 	if err != nil {
 		t.Fatalf("generate fake relay key: %v", err)
 	}
+	descriptorKey, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("generate fake relay descriptor key: %v", err)
+	}
 	now := time.Now()
 	template := &x509.Certificate{
 		SerialNumber:          big.NewInt(1),
@@ -169,20 +186,29 @@ func newFakeRelay(t *testing.T, name string, options fakeRelayOptions) *fakeRela
 	}
 	port := baseListener.Addr().(*net.TCPAddr).Port
 	relay := &fakeRelay{
-		name:         name,
-		url:          "https://localhost:" + strconv.Itoa(port),
-		port:         port,
-		leaf:         leaf,
-		key:          key,
-		listener:     baseListener,
-		serveDone:    make(chan error, 1),
-		options:      options,
-		changed:      make(chan struct{}),
-		errors:       make(chan error, 32),
-		sessions:     make(map[int]*fakeRelaySession),
-		bindings:     make(map[string]struct{}),
-		capabilities: make(map[string]string),
+		name:          name,
+		url:           "https://localhost:" + strconv.Itoa(port),
+		port:          port,
+		leaf:          leaf,
+		key:           key,
+		descriptorKey: descriptorKey,
+		listener:      baseListener,
+		serveDone:     make(chan error, 1),
+		options:       options,
+		changed:       make(chan struct{}),
+		errors:        make(chan error, 32),
+		sessions:      make(map[int]*fakeRelaySession),
+		bindings:      make(map[string]struct{}),
+		capabilities:  make(map[string]string),
 	}
+	descriptorNow := time.Now().UTC()
+	relay.discoveryRelays = []relayDescriptor{
+		signDescriptorWithKey(t, descriptorKey, relay.url, descriptorNow),
+	}
+	for _, relayURL := range options.advertiseRelays {
+		relay.discoveryRelays = append(relay.discoveryRelays, signDescriptorWithNewKey(t, relayURL, descriptorNow))
+	}
+
 	tlsConfig := &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{certificate},
@@ -353,12 +379,74 @@ func (r *fakeRelay) ServeHTTP(response http.ResponseWriter, request *http.Reques
 		r.handleUnregister(response, request)
 	case pathConnect:
 		r.handleConnect(response, request)
+	case pathDiscovery:
+		r.handleDiscovery(response, request)
 	case "/v1/sign":
 		r.handleSign(response, request)
 	default:
 		r.recordError(fmt.Errorf("%s: unexpected path %s", r.name, request.URL.Path))
 		r.fail(response, http.StatusNotFound, "not_found", "not found")
 	}
+}
+
+// signDescriptorWithKey produces a descriptor whose signature verifies against
+// its own Address, exactly as a real relay does.
+func signDescriptorWithKey(t testing.TB, key *secp256k1.PrivateKey, relayURL string, now time.Time) relayDescriptor {
+	t.Helper()
+	descriptor := relayDescriptor{
+		Address:      ethereumAddress(key.PubKey()),
+		Version:      discoveryProtocolVersion,
+		IssuedAt:     now,
+		ExpiresAt:    now.Add(5 * time.Minute),
+		APIHTTPSAddr: relayURL,
+		SupportsUDP:  true,
+		SupportsTCP:  true,
+	}
+	canonical, err := canonicalDescriptorBytes(descriptor)
+	if err != nil {
+		t.Fatalf("canonicalize descriptor: %v", err)
+	}
+	digest := sha256.Sum256(canonical)
+	compact := ecdsa.SignCompact(key, digest[:], false)
+	descriptor.Signature = base64.StdEncoding.EncodeToString(compact)
+	return descriptor
+}
+
+// signDescriptorWithNewKey signs a descriptor for a relay the test does not
+// otherwise model, which is enough to prove discovery adoption.
+func signDescriptorWithNewKey(t testing.TB, relayURL string, now time.Time) relayDescriptor {
+	t.Helper()
+	key, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("generate advertised relay key: %v", err)
+	}
+	return signDescriptorWithKey(t, key, relayURL, now)
+}
+
+// handleDiscovery publishes a signed descriptor for this relay plus any relays
+// the test asked it to advertise.
+func (r *fakeRelay) handleDiscovery(response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		r.badRequest(response, fmt.Errorf("discovery method = %s", request.Method))
+		return
+	}
+	r.mu.Lock()
+	r.discoveryCount++
+	unsupported := r.options.discoveryUnsupported
+	advertised := append([]string(nil), r.options.advertiseRelays...)
+	r.signalLocked()
+	r.mu.Unlock()
+
+	_ = advertised
+	revision := discoveryProtocolVersion
+	if unsupported {
+		revision = "1"
+	}
+	r.success(response, map[string]any{
+		"protocol_version": revision,
+		"generated_at":     time.Now().UTC(),
+		"relays":           r.discoveryRelays,
+	})
 }
 
 func (r *fakeRelay) handleDomain(response http.ResponseWriter, request *http.Request) {
@@ -1137,6 +1225,7 @@ func (r *fakeRelay) close() {
 func testRelayTimings() relayTimings {
 	return relayTimings{
 		leaseTTL:         time.Second,
+		discoveryPoll:    25 * time.Millisecond,
 		renewBefore:      100 * time.Millisecond,
 		retryWait:        10 * time.Millisecond,
 		dialTimeout:      2 * time.Second,

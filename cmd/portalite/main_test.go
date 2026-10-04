@@ -11,6 +11,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -28,8 +30,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/decred/dcrd/dcrec/secp256k1/v4"
+	secp256k1ecdsa "github.com/decred/dcrd/dcrec/secp256k1/v4/ecdsa"
 	ksigner "github.com/gosuda/keyless_tls/relay/signer"
 	"github.com/gosuda/keyless_tls/relay/signrpc"
+	"golang.org/x/crypto/sha3"
 
 	"gosuda.org/portalite"
 )
@@ -743,11 +748,13 @@ func waitRunExit(t *testing.T, done <-chan int) int {
 }
 
 type cliTestRelay struct {
-	server  *httptest.Server
-	url     string
-	port    int
-	key     *ecdsa.PrivateKey
-	certPEM []byte
+	server        *httptest.Server
+	url           string
+	port          int
+	key           *ecdsa.PrivateKey
+	descriptorKey *secp256k1.PrivateKey
+	descriptors   []map[string]any
+	certPEM       []byte
 
 	mu              sync.Mutex
 	identityName    string
@@ -767,6 +774,10 @@ func newCLITestRelay(t *testing.T) *cliTestRelay {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatalf("generate relay key: %v", err)
+	}
+	descriptorKey, err := secp256k1.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("generate relay descriptor key: %v", err)
 	}
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
 	if err != nil {
@@ -796,12 +807,18 @@ func newCLITestRelay(t *testing.T) *cliTestRelay {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 
 	relay := &cliTestRelay{
-		key:          key,
-		certPEM:      certPEM,
-		connections:  make(map[net.Conn]struct{}),
-		bindings:     make(map[string]struct{}),
-		connectReady: make(chan net.Conn, 32),
+		key:           key,
+		descriptorKey: descriptorKey,
+		certPEM:       certPEM,
+		connections:   make(map[net.Conn]struct{}),
+		bindings:      make(map[string]struct{}),
+		connectReady:  make(chan net.Conn, 32),
 	}
+	descriptorNow := time.Now().UTC()
+	relay.descriptors = []map[string]any{
+		signCLIDescriptor(t, descriptorKey, relay.url, descriptorNow),
+	}
+
 	server := httptest.NewUnstartedServer(http.HandlerFunc(relay.handle))
 	server.EnableHTTP2 = false
 	server.TLS = &tls.Config{
@@ -933,6 +950,8 @@ func (r *cliTestRelay) handle(w http.ResponseWriter, request *http.Request) {
 		r.unregisters++
 		r.mu.Unlock()
 		r.writeOK(w, struct{}{})
+	case "/discovery":
+		r.handleDiscovery(w, request)
 	case "/v1/sign":
 		r.handleSign(w, request)
 	case "/sdk/connect":
@@ -957,6 +976,70 @@ func (r *cliTestRelay) writeOK(w http.ResponseWriter, data any) {
 	if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "data": data}); err != nil {
 		r.recordFailure(fmt.Errorf("write relay response: %w", err))
 	}
+}
+
+// cliDescriptorCanonical mirrors the relay's descriptor signing payload.
+type cliDescriptorCanonical struct {
+	Address           string  `json:"address"`
+	Version           string  `json:"version"`
+	IssuedAtUnixNano  int64   `json:"issued_at_unix_nano"`
+	ExpiresAtUnixNano int64   `json:"expires_at_unix_nano"`
+	APIHTTPSAddr      string  `json:"api_https_addr"`
+	SupportsUDP       bool    `json:"supports_udp"`
+	SupportsTCP       bool    `json:"supports_tcp"`
+	ActiveConnections int64   `json:"active_connections"`
+	TCPBPS            float64 `json:"tcp_bps"`
+}
+
+func cliEthereumAddress(publicKey *secp256k1.PublicKey) string {
+	uncompressed := publicKey.SerializeUncompressed()
+	hasher := sha3.NewLegacyKeccak256()
+	_, _ = hasher.Write(uncompressed[1:])
+	digest := hasher.Sum(nil)
+	return "0x" + hex.EncodeToString(digest[len(digest)-20:])
+}
+
+// signCLIDescriptor builds a signed /discovery descriptor for one relay URL.
+func signCLIDescriptor(t *testing.T, key *secp256k1.PrivateKey, relayURL string, now time.Time) map[string]any {
+	t.Helper()
+	expiresAt := now.Add(5 * time.Minute)
+	canonical := cliDescriptorCanonical{
+		Address:           cliEthereumAddress(key.PubKey()),
+		Version:           "9",
+		IssuedAtUnixNano:  now.UnixNano(),
+		ExpiresAtUnixNano: expiresAt.UnixNano(),
+		APIHTTPSAddr:      relayURL,
+		SupportsUDP:       true,
+		SupportsTCP:       true,
+	}
+	payload, err := json.Marshal(canonical)
+	if err != nil {
+		t.Fatalf("canonicalize descriptor: %v", err)
+	}
+	digest := sha256.Sum256(payload)
+	compact := secp256k1ecdsa.SignCompact(key, digest[:], false)
+	return map[string]any{
+		"address":        canonical.Address,
+		"version":        canonical.Version,
+		"issued_at":      now,
+		"expires_at":     expiresAt,
+		"api_https_addr": relayURL,
+		"supports_udp":   true,
+		"supports_tcp":   true,
+		"signature":      base64.StdEncoding.EncodeToString(compact),
+	}
+}
+
+func (r *cliTestRelay) handleDiscovery(w http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.writeOK(w, map[string]any{
+		"protocol_version": "9",
+		"generated_at":     time.Now().UTC(),
+		"relays":           r.descriptors,
+	})
 }
 
 func (r *cliTestRelay) handleSign(w http.ResponseWriter, request *http.Request) {

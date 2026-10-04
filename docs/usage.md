@@ -235,6 +235,30 @@ A bare port binds either proxy target to `127.0.0.1`. URL schemes, paths, bare h
 
 Relay availability is operational state, not a static guarantee. Consume `Updates`, call `WaitReady`, or inspect `Relays` instead of assuming every configured relay is reachable.
 
+## Relay discovery
+
+Discovery is **on by default**. Each exposure polls `/discovery` on its current relays and adds the relays they advertise, so the exposed set tracks the network instead of a frozen list. Relays passed in `Relays` are always retained and are never removed.
+
+```go
+listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
+	Identity:        identity,
+	Relays:          portalite.DefaultRelays(),
+	MaxActiveRelays: 8, // optional cap; explicit relays are always kept
+})
+```
+
+- `DisableDiscovery` restores fixed membership: exactly the relays you passed, with no `/discovery` requests.
+- `MaxActiveRelays` caps how many relays are supervised at once. Zero selects a default; the cap is raised to the number of explicit relays when necessary.
+- `UDPEnabled` exposures only adopt relays whose descriptor advertises a UDP backhaul, so discovery cannot hand them a relay that would fail with `udp_disabled`.
+
+### Discovery trust
+
+A relay descriptor is a **self-signed** advertisement: the exposure verifies that the signature recovers to the address inside the descriptor, and that the descriptor is unexpired. That proves the advertiser controls the address it claims, and nothing more.
+
+In particular, a verified relay vouches only for itself. Its mention of another relay is not evidence about that relay, so every adopted candidate is verified on its own and then has to pass the same tunnel-protocol and tenant-certificate checks as an explicit relay before it can serve. A relay that answers with an unsupported discovery revision, or with descriptors that do not verify, contributes nothing.
+
+Adoption is additive and failure-isolated: a relay that fails terminally is never re-adopted, and the other relays keep serving. Because membership is dynamic, a total relay failure is recoverable while discovery is enabled, so `Accept` waits for a new candidate instead of reporting `ErrNoRelays`; `WaitReady` reports `ErrNoRelays` only once discovery has refreshed and produced no usable candidate.
+
 ## UDP support
 
 Set `UDPEnabled` when creating an exposure. Each supporting relay allocates a public UDP address and authenticates a separate QUIC DATAGRAM backhaul with the current lease token.

@@ -80,6 +80,7 @@ type relayTimings struct {
 	requestTimeout   time.Duration
 	idleTimeout      time.Duration
 	shutdownTimeout  time.Duration
+	discoveryPoll    time.Duration
 }
 
 func defaultRelayTimings() relayTimings {
@@ -92,6 +93,7 @@ func defaultRelayTimings() relayTimings {
 		requestTimeout:   30 * time.Second,
 		idleTimeout:      60 * time.Second,
 		shutdownTimeout:  5 * time.Second,
+		discoveryPoll:    discoveryPollInterval,
 	}
 }
 
@@ -121,6 +123,10 @@ func (t relayTimings) withDefaults() relayTimings {
 	if t.shutdownTimeout <= 0 {
 		t.shutdownTimeout = d.shutdownTimeout
 	}
+	if t.discoveryPoll <= 0 {
+		t.discoveryPoll = d.discoveryPoll
+	}
+
 	return t
 }
 
