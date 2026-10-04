@@ -220,16 +220,18 @@ A bare port binds either proxy target to `127.0.0.1`. URL schemes, paths, bare h
 
 ## Default relays
 
-`portalite.DefaultRelays()` returns a defensive copy of the built-in registry, which mirrors the canonical relay registry published by `gosuda/portal-tunnel`:
+`portalite.DefaultRelays()` returns a defensive copy of the built-in bootstrap registry. It is the union of relays currently published by the network's `/discovery` endpoint, each validated against the tunnel protocol this SDK speaks:
 
 1. `https://gosunuts.xyz`
-2. `https://portal.thumbgo.kr`
-3. `https://portal.rabbitson87.dev`
-4. `https://s-h.day`
+2. `https://kakashit.org`
+3. `https://korokorok.com`
+4. `https://portal.damn.it.com`
 5. `https://portal.dawnfullstack.com`
-6. `https://kakashit.org`
-7. `https://portal.damn.it.com`
-8. `https://portal.dps0340.win`
+6. `https://portal.naratteu.dynv6.net`
+7. `https://portal.rabbitson87.dev`
+8. `https://portal.thumbgo.kr`
+9. `https://rly.best`
+10. `https://s-h.day`
 
 Relay availability is operational state, not a static guarantee. Consume `Updates`, call `WaitReady`, or inspect `Relays` instead of assuming every configured relay is reachable.
 
