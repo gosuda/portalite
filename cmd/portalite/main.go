@@ -19,7 +19,7 @@ import (
 	"gosuda.org/portalite"
 )
 
-const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--udp-target TARGET] [TARGET]\n"
+const usageLine = "Usage: portalite expose [--relay HTTPS_URL]... [--identity FILE] [--name LABEL] [--ephemeral] [--no-discovery] [--udp-target TARGET] [TARGET]\n"
 
 type relayFlags []string
 
@@ -96,10 +96,12 @@ func runWithIdentityModes(
 	var name string
 	var udpTarget string
 	var ephemeral bool
+	var noDiscovery bool
 	fs.Var(&relayValues, "relay", "relay HTTPS URL")
 	fs.StringVar(&identityPath, "identity", "identity.json", "identity file")
 	fs.StringVar(&name, "name", "", "identity name for a new identity")
 	fs.BoolVar(&ephemeral, "ephemeral", false, "keep the identity in memory and never write it to disk")
+	fs.BoolVar(&noDiscovery, "no-discovery", false, "use only the relays given with --relay")
 	fs.StringVar(&udpTarget, "udp-target", "", "local UDP target")
 	if err := fs.Parse(args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -161,9 +163,10 @@ func runWithIdentityModes(
 		return 0
 	}
 	exposure, err := portalite.Expose(ctx, portalite.ExposeConfig{
-		Relays:     relays,
-		Identity:   identity,
-		UDPEnabled: udpTarget != "",
+		Relays:           relays,
+		Identity:         identity,
+		UDPEnabled:       udpTarget != "",
+		DisableDiscovery: noDiscovery,
 	})
 	if err != nil {
 		if ctx.Err() != nil {

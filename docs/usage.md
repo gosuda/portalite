@@ -183,7 +183,9 @@ Expose TCP and UDP targets under the same relay lease:
 
 Flags must appear before the optional TCP target. Repeating `--relay` replaces the built-in relay set; canonical duplicates are removed while preserving input order. Without `--relay`, the CLI uses `portalite.DefaultRelays()`. At least one TCP target or `--udp-target` is required.
 
-The full flag set is `--relay`, `--identity`, `--name`, `--ephemeral`, and `--udp-target`. `--identity` defaults to `identity.json` and names the file the CLI reads or creates; `--ephemeral` replaces that file with an in-memory identity and cannot be combined with an explicit `--identity`. See [Ephemeral identity](#ephemeral-identity) for the `--name` reuse caveat.
+The full flag set is `--relay`, `--identity`, `--name`, `--ephemeral`, `--no-discovery`, and `--udp-target`. `--identity` defaults to `identity.json` and names the file the CLI reads or creates; `--ephemeral` replaces that file with an in-memory identity and cannot be combined with an explicit `--identity`. See [Ephemeral identity](#ephemeral-identity) for the `--name` reuse caveat.
+
+Relays passed with `--relay` are always used, and by default the exposure also adopts relays advertised through [relay discovery](#relay-discovery). `--no-discovery` disables that, so only the relays you named are used.
 
 The command writes one line per ready relay to stdout:
 
@@ -243,12 +245,17 @@ Discovery is **on by default**. Each exposure polls `/discovery` on its current 
 listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
 	Identity:        identity,
 	Relays:          portalite.DefaultRelays(),
-	MaxActiveRelays: 8, // optional cap; explicit relays are always kept
+	MaxActiveRelays: 4, // optional cap on discovered additions
 })
 ```
 
+```sh
+# only the relays named with --relay
+./portalite expose --no-discovery --relay https://relay.example 3000
+```
+
 - `DisableDiscovery` restores fixed membership: exactly the relays you passed, with no `/discovery` requests.
-- `MaxActiveRelays` caps how many relays are supervised at once. Zero selects a default; the cap is raised to the number of explicit relays when necessary.
+- `MaxActiveRelays` caps how many relays discovery may add on top of the explicit set. Zero selects a default. Explicit relays are never subject to the cap, so a large `Relays` list cannot make discovery inert.
 - `UDPEnabled` exposures only adopt relays whose descriptor advertises a UDP backhaul, so discovery cannot hand them a relay that would fail with `udp_disabled`.
 
 ### Discovery trust

@@ -10,7 +10,9 @@ import (
 	"time"
 )
 
-// ErrNoRelays is returned by Accept after every configured relay has failed.
+// ErrNoRelays is returned by Accept and WaitReady once every relay has failed
+// and no replacement is available. With discovery enabled that verdict waits
+// for a discovery refresh, so a new candidate can still revive the exposure.
 var ErrNoRelays = errors.New("portalite: no relays available")
 
 // RelayState is the lifecycle state of one independently supervised relay.
@@ -44,8 +46,9 @@ type ExposeConfig struct {
 	// exposed relay set tracks the network instead of a frozen list.
 	DisableDiscovery bool
 
-	// MaxActiveRelays caps how many relays the exposure supervises at once.
-	// Relays passed in Relays are always retained. Zero selects the default.
+	// MaxActiveRelays caps how many relays discovery may add on top of the
+	// relays passed in Relays, which are always retained. Zero selects the
+	// default.
 	MaxActiveRelays int
 }
 
@@ -82,12 +85,15 @@ type Exposure struct {
 	timings  relayTimings
 
 	discoveryEnabled bool
-	maxActiveRelays  int
-	candidates       *discoveryCandidates
-	discoveryClient  *discoveryClient
-	discoveryPoll    time.Duration
-	discoveryDone    sync.WaitGroup
-	discoveryKick    chan struct{}
+	// maxDiscoveredRelays bounds relays discovery may add; explicit relays
+	// are never subject to it.
+	maxDiscoveredRelays int
+	discoveredCount     int
+	candidates          *discoveryCandidates
+	discoveryClient     *discoveryClient
+	discoveryPoll       time.Duration
+	discoveryDone       sync.WaitGroup
+	discoveryKick       chan struct{}
 
 	closeOnce       sync.Once
 	closeDone       chan struct{}
@@ -129,19 +135,15 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 		return nil, errors.New("portalite: at least one relay is required")
 	}
 
-	maxActiveRelays := cfg.MaxActiveRelays
-	if maxActiveRelays <= 0 {
-		maxActiveRelays = defaultMaxActiveRelays
-	}
-	if maxActiveRelays < len(relays) {
-		// Explicit relays are always retained, so the cap can never sit
-		// below the set the caller asked for.
-		maxActiveRelays = len(relays)
+	maxDiscoveredRelays := cfg.MaxActiveRelays
+	if maxDiscoveredRelays <= 0 {
+		maxDiscoveredRelays = defaultMaxActiveRelays
 	}
 	discoveryEnabled := !cfg.DisableDiscovery
 
 	exposureCtx, cancel := context.WithCancel(ctx)
-	capacity := maxActiveRelays
+	// Buffers must cover the explicit set plus everything discovery can add.
+	capacity := len(relays) + maxDiscoveredRelays
 	acceptCapacity := 2 * capacity
 	if acceptCapacity < 1 {
 		acceptCapacity = 1
@@ -151,25 +153,25 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 		datagramCapacity = 1
 	}
 	e := &Exposure{
-		ctx:              exposureCtx,
-		cancel:           cancel,
-		addr:             exposureAddr{address: cfg.Identity.Address()},
-		accepted:         make(chan net.Conn, acceptCapacity),
-		updates:          make(chan RelayStatus, 4*capacity),
-		datagrams:        make(chan DatagramFrame, datagramCapacity),
-		statuses:         make(map[string]RelayStatus, capacity),
-		udpEnabled:       cfg.UDPEnabled,
-		allFailed:        make(chan struct{}),
-		stateChanged:     make(chan struct{}),
-		rejectedRelays:   make(map[string]struct{}),
-		relaySupervisors: make(map[string]*relaySupervisor, capacity),
-		identity:         cfg.Identity,
-		timings:          timings,
-		discoveryEnabled: discoveryEnabled,
-		maxActiveRelays:  maxActiveRelays,
-		discoveryPoll:    timings.discoveryPoll,
-		closeDone:        make(chan struct{}),
-		parentWatchStop:  make(chan struct{}),
+		ctx:                 exposureCtx,
+		cancel:              cancel,
+		addr:                exposureAddr{address: cfg.Identity.Address()},
+		accepted:            make(chan net.Conn, acceptCapacity),
+		updates:             make(chan RelayStatus, 4*capacity),
+		datagrams:           make(chan DatagramFrame, datagramCapacity),
+		statuses:            make(map[string]RelayStatus, capacity),
+		udpEnabled:          cfg.UDPEnabled,
+		allFailed:           make(chan struct{}),
+		stateChanged:        make(chan struct{}),
+		rejectedRelays:      make(map[string]struct{}),
+		relaySupervisors:    make(map[string]*relaySupervisor, capacity),
+		identity:            cfg.Identity,
+		timings:             timings,
+		discoveryEnabled:    discoveryEnabled,
+		maxDiscoveredRelays: maxDiscoveredRelays,
+		discoveryPoll:       timings.discoveryPoll,
+		closeDone:           make(chan struct{}),
+		parentWatchStop:     make(chan struct{}),
 	}
 	if discoveryEnabled {
 		e.candidates = newDiscoveryCandidates()
@@ -195,18 +197,18 @@ func exposeWithTimings(ctx context.Context, cfg ExposeConfig, timings relayTimin
 	return e, nil
 }
 
-// addRelays starts one supervisor per relay, skipping relays that are already
-// members, already rejected, or beyond the active cap.
+// addRelays starts one supervisor per relay. Explicit relays are pinned: they
+// are always retained and never count against the discovery cap.
 func (e *Exposure) addRelays(relayURLs []string) error {
 	for _, relayURL := range relayURLs {
-		if err := e.addRelay(relayURL); err != nil {
+		if err := e.addRelay(relayURL, true); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (e *Exposure) addRelay(relayURL string) error {
+func (e *Exposure) addRelay(relayURL string, explicit bool) error {
 	supervisor, err := newRelaySupervisor(relayURL, e.identity, e.timings)
 	if err != nil {
 		return fmt.Errorf("portalite: relay %s: %w", relayURL, err)
@@ -226,7 +228,7 @@ func (e *Exposure) addRelay(relayURL string) error {
 		e.mu.Unlock()
 		return nil
 	}
-	if len(e.statuses) >= e.maxActiveRelays {
+	if !explicit && e.discoveredCount >= e.maxDiscoveredRelays {
 		e.mu.Unlock()
 		return nil
 	}
@@ -234,6 +236,9 @@ func (e *Exposure) addRelay(relayURL string) error {
 	e.statuses[relayURL] = status
 	e.relaySupervisors[relayURL] = supervisor
 	e.relayCount++
+	if !explicit {
+		e.discoveredCount++
+	}
 	// Membership grew, so a previously exhausted exposure is live again.
 	e.rearmAllFailedLocked()
 	e.notifyStateChangedLocked()
@@ -242,7 +247,7 @@ func (e *Exposure) addRelay(relayURL string) error {
 	e.supervisors.Add(1)
 	e.mu.Unlock()
 
-	e.updates <- status
+	e.publishUpdate(status)
 	go e.runSupervisor(supervisor)
 	return nil
 }
@@ -325,7 +330,7 @@ func (e *Exposure) adoptDiscoveredRelays(now time.Time, requireUDP bool) {
 		if e.ctx.Err() != nil {
 			return
 		}
-		if err := e.addRelay(relayURL); err != nil {
+		if err := e.addRelay(relayURL, false); err != nil {
 			continue
 		}
 	}
@@ -367,6 +372,27 @@ func (e *Exposure) markExhausted() {
 	e.notifyStateChangedLocked()
 	e.mu.Unlock()
 	e.drainAccepted()
+}
+
+// publishUpdate delivers a lifecycle status without ever blocking the caller.
+// Updates is a notification stream, not the source of truth: Relays returns
+// the authoritative snapshot, and a caller that never drains the stream must
+// not be able to stall a supervisor or deadlock Close.
+func (e *Exposure) publishUpdate(status RelayStatus) {
+	select {
+	case e.updates <- status:
+	default:
+		// The buffer is full because nobody is reading. Drop the oldest
+		// notification and keep the newest state visible.
+		select {
+		case <-e.updates:
+		default:
+		}
+		select {
+		case e.updates <- status:
+		default:
+		}
+	}
 }
 
 // stateChangedSignal snapshots the state-change channel so a blocked caller
@@ -455,7 +481,7 @@ func (e *Exposure) markReady(relayURL, publicURL string) {
 	e.statuses[relayURL] = status
 	e.notifyStateChangedLocked()
 	e.mu.Unlock()
-	e.updates <- status
+	e.publishUpdate(status)
 }
 
 func (e *Exposure) markFailed(relayURL string, relayErr error) {
@@ -476,7 +502,7 @@ func (e *Exposure) markFailed(relayURL string, relayErr error) {
 	allFailed := e.failedCount >= e.relayCount
 	e.mu.Unlock()
 
-	e.updates <- status
+	e.publishUpdate(status)
 	if !allFailed {
 		return
 	}
@@ -507,7 +533,7 @@ func (e *Exposure) markDatagramReady(relayURL, udpAddr string) {
 	e.mu.Unlock()
 	if announce {
 		status.State = RelayUDPReady
-		e.updates <- status
+		e.publishUpdate(status)
 	}
 }
 

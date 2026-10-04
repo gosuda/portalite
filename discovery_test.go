@@ -205,8 +205,9 @@ func TestExposureDisableDiscoveryKeepsMembershipFixed(t *testing.T) {
 	}
 }
 
-// MaxActiveRelays caps membership, and explicit relays are always retained.
-func TestExposureMaxActiveRelaysCapsMembership(t *testing.T) {
+// MaxActiveRelays caps how many relays discovery may add; explicit relays are
+// retained regardless of the cap.
+func TestExposureMaxActiveRelaysCapsDiscoveredAdditions(t *testing.T) {
 	first := newFakeRelay(t, "cap-a", fakeRelayOptions{})
 	defer first.close()
 	second := newFakeRelay(t, "cap-b", fakeRelayOptions{})
@@ -221,7 +222,7 @@ func TestExposureMaxActiveRelaysCapsMembership(t *testing.T) {
 	exposure, err := exposeWithTimings(ctx, ExposeConfig{
 		Relays:          []string{seed.url},
 		Identity:        newTestIdentity(t),
-		MaxActiveRelays: 2,
+		MaxActiveRelays: 1,
 	}, testRelayTimings())
 	if err != nil {
 		t.Fatalf("Expose: %v", err)
@@ -229,16 +230,14 @@ func TestExposureMaxActiveRelaysCapsMembership(t *testing.T) {
 	defer exposure.Close()
 
 	_ = waitForReady(t, exposure, 1)
-	deadline := time.Now().Add(fakeRelayWait)
-	for time.Now().Before(deadline) {
-		if len(exposure.Relays()) >= 2 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	seed.waitFor(t, "a discovered relay to be adopted", func() bool {
+		return len(exposure.Relays()) >= 2
+	})
+	// Settle: the cap must hold at one discovered addition.
+	time.Sleep(150 * time.Millisecond)
 	statuses := exposure.Relays()
 	if len(statuses) != 2 {
-		t.Fatalf("relays = %+v, want the cap of 2", statuses)
+		t.Fatalf("relays = %+v, want the seed plus exactly one discovered relay", statuses)
 	}
 	found := false
 	for _, status := range statuses {
@@ -248,6 +247,52 @@ func TestExposureMaxActiveRelaysCapsMembership(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("relays = %+v, want the explicit seed retained", statuses)
+	}
+}
+
+// The cap bounds discovered additions, so an explicit set as large as the cap
+// still grows. This is the default path: DefaultRelays already fills a naive
+// total-membership cap, which would make discovery inert.
+func TestExposureDiscoveryExpandsBeyondExplicitSetSize(t *testing.T) {
+	var explicit []string
+	var relays []*fakeRelay
+	// Three explicit relays, matching the shape of the built-in list.
+	for _, name := range []string{"explicit-a", "explicit-b", "explicit-c"} {
+		relay := newFakeRelay(t, name, fakeRelayOptions{})
+		relays = append(relays, relay)
+		explicit = append(explicit, relay.url)
+	}
+	defer func() {
+		for _, relay := range relays {
+			relay.close()
+		}
+	}()
+
+	advertised := newFakeRelay(t, "beyond-cap", fakeRelayOptions{})
+	defer advertised.close()
+	relays[0].options.advertiseRelays = []string{advertised.url}
+	relays[0].discoveryRelays = append(relays[0].discoveryRelays,
+		signDescriptorWithNewKey(t, advertised.url, time.Now().UTC()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+		Relays:          explicit,
+		Identity:        newTestIdentity(t),
+		MaxActiveRelays: 3, // equal to the explicit set size
+	}, testRelayTimings())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	defer exposure.Close()
+
+	relays[0].waitFor(t, "discovery to expand past the explicit set size", func() bool {
+		return len(exposure.Relays()) >= len(explicit)+1
+	})
+	statuses := exposure.Relays()
+	if len(statuses) != len(explicit)+1 {
+		t.Fatalf("relays = %d, want %d: discovery must add relays beyond the explicit set",
+			len(statuses), len(explicit)+1)
 	}
 }
 

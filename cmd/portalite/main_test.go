@@ -683,6 +683,52 @@ func TestRunEndToEndTerminalRelayFailure(t *testing.T) {
 	}
 }
 
+// --no-discovery must keep the exposure on exactly the relays the user named.
+func TestRunNoDiscoveryUsesOnlyExplicitRelays(t *testing.T) {
+	relay := newCLITestRelay(t)
+	defer relay.Close()
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "pinned target reached")
+	}))
+	defer target.Close()
+	targetAddress := strings.TrimPrefix(target.URL, "http://")
+
+	identityPath := filepath.Join(t.TempDir(), "identity.json")
+	ctx, cancel := context.WithCancel(context.Background())
+	args := []string{
+		"expose",
+		"--no-discovery",
+		"--relay", relay.URL(),
+		"--identity", identityPath,
+		"--name", "pinned-test",
+		targetAddress,
+	}
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() {
+		done <- run(ctx, args, &stdout, &stderr)
+	}()
+
+	body, err := relay.TenantRequest("pinned-test", "/")
+	if err != nil {
+		t.Fatalf("tenant request: %v", err)
+	}
+	if body != "pinned target reached" {
+		t.Fatalf("tenant response body = %q", body)
+	}
+	// Give a discovery loop time to run if the flag were ignored.
+	time.Sleep(150 * time.Millisecond)
+	if got := relay.DiscoveryCount(); got != 0 {
+		t.Fatalf("discovery requests = %d, want 0 with --no-discovery", got)
+	}
+
+	cancel()
+	if exit := waitRunExit(t, done); exit != 0 {
+		t.Fatalf("run exit = %d, want 0", exit)
+	}
+	relay.AssertHealthy(t)
+}
+
 func TestRunCancelExitsZeroAndExplicitRelaysReplaceDefaults(t *testing.T) {
 	relay := newCLITestRelay(t)
 	defer relay.Close()
@@ -760,6 +806,7 @@ type cliTestRelay struct {
 	identityName    string
 	identityAddress string
 	registrations   int
+	discoveries     int
 	unregisters     int
 	failure         error
 	failConnect     bool
@@ -843,6 +890,12 @@ func newCLITestRelay(t *testing.T) *cliTestRelay {
 }
 
 func (r *cliTestRelay) URL() string { return r.url }
+
+func (r *cliTestRelay) DiscoveryCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.discoveries
+}
 
 func (r *cliTestRelay) SNIPort() int { return r.port }
 
@@ -1035,6 +1088,9 @@ func (r *cliTestRelay) handleDiscovery(w http.ResponseWriter, request *http.Requ
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	r.mu.Lock()
+	r.discoveries++
+	r.mu.Unlock()
 	r.writeOK(w, map[string]any{
 		"protocol_version": "9",
 		"generated_at":     time.Now().UTC(),

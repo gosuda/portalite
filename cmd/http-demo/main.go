@@ -40,8 +40,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(io.Discard)
 	var relays relayFlags
 	var name string
+	var noDiscovery bool
 	fs.Var(&relays, "relay", "relay HTTPS URL")
 	fs.StringVar(&name, "name", "", "ephemeral identity name")
+	fs.BoolVar(&noDiscovery, "no-discovery", false, "use only the relays given with --relay")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			_, _ = io.WriteString(stdout, usageLine)
@@ -76,8 +78,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 
 	listener, err := portalite.Expose(ctx, portalite.ExposeConfig{
-		Relays:   normalizedRelays,
-		Identity: identity,
+		Relays:           normalizedRelays,
+		Identity:         identity,
+		DisableDiscovery: noDiscovery,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "portalite-http-demo: %v\n", err)

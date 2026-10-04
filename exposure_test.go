@@ -1259,9 +1259,16 @@ func newTargetServer(t *testing.T) (*httptest.Server, string) {
 	return target, parsed.Host
 }
 
+// startTestProxy builds a proxy-focused exposure. Discovery is disabled so
+// relay traffic, including the handshake indices these tests count, is not
+// perturbed by discovery polling. Discovery has dedicated tests.
 func startTestProxy(t *testing.T, ctx context.Context, identity Identity, relays []string, timings relayTimings, target string) (*Exposure, <-chan error) {
 	t.Helper()
-	exposure, err := exposeWithTimings(ctx, ExposeConfig{Relays: relays, Identity: identity}, timings)
+	exposure, err := exposeWithTimings(ctx, ExposeConfig{
+		Relays:           relays,
+		Identity:         identity,
+		DisableDiscovery: true,
+	}, timings)
 	if err != nil {
 		t.Fatalf("Expose: %v", err)
 	}
